@@ -6,17 +6,13 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net"
 	"os"
 	"strings"
 	"time"
-)
-
-var (
-	send_port   int
-	listen_port int
 )
 
 const (
@@ -33,73 +29,54 @@ type Message struct {
 	Data    [MESSAGE_DATA_SIZE]byte
 }
 
-var test_rng *rand.Rand
+func get_user_input(send_message_channel chan<- Message) {
+	input_scanner := bufio.NewScanner(os.Stdin)
+	defer input_scanner.Err()
 
-func read_user_input(send_message chan<- Message) {
-	scanner := bufio.NewScanner(os.Stdin)
-
-	buf := make([]byte, 1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	message_buf := make([]Message, 512)
+	message_buf := make([]Message, 128)
 
 	fmt.Print("> ")
 
-	for scanner.Scan() {
+	for input_scanner.Scan() {
+		raw := input_scanner.Text()
+		text := strings.TrimRight(raw, "\r\n")
 
-		text := scanner.Text()
-		line := strings.TrimRight(text, "\r\n")
-
-		n_messages_to_transmit := int(math.Ceil(float64(len(line)) / float64(MESSAGE_DATA_SIZE)))
-
-		messages_to_transmit := message_buf[:n_messages_to_transmit]
-		pos_in_line := 0
-		for i := 0; i < n_messages_to_transmit; i++ {
-			m := &messages_to_transmit[i]
-			*m = Message{}
-
-			for j := 0; j < len(m.Data) && pos_in_line < len(line); j++ {
-				m.Data[j] = line[pos_in_line]
-				pos_in_line++
-			}
-
+		if len(text) == 0 {
+			fmt.Print("> ")
+			continue
 		}
 
-		messages_to_transmit[0].Flags |= MESSAGE_FLAG_BEGIN_TEXT
-		messages_to_transmit[n_messages_to_transmit-1].Flags |= MESSAGE_FLAG_END_TEXT
+		n_messages_to_send := int(math.Ceil(float64(len(text)) / float64(MESSAGE_DATA_SIZE)))
 
-		for _, m := range messages_to_transmit {
-			send_message <- m
+		messages_to_send := message_buf[:0]
+
+		text_pos := 0
+		for range n_messages_to_send {
+
+			message := Message{}
+
+			for j := 0; j < MESSAGE_DATA_SIZE && text_pos < len(text); j++ {
+				message.Data[j] = text[text_pos]
+				text_pos++
+			}
+
+			messages_to_send = append(messages_to_send, message)
+		}
+
+		messages_to_send[0].Flags |= MESSAGE_FLAG_BEGIN_TEXT
+		messages_to_send[n_messages_to_send-1].Flags |= MESSAGE_FLAG_END_TEXT
+
+		for _, m := range messages_to_send {
+			send_message_channel <- m
 		}
 
 		fmt.Print("> ")
 
 	}
-
 }
 
-func send_message(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) error {
-	var buf bytes.Buffer
-
-	// NOTE jfd 15/06/26: randomly drop messages here to make sure the acks work
-	if test_rng.Int() % 2 == 0 {
-		return nil
-	}
-
-	err := binary.Write(&buf, binary.BigEndian, message)
-
-	if err != nil {
-		return err
-	}
-
-	data := buf.Bytes()
-	_, err = conn.WriteToUDP(data, send_addr)
-
-	return err
-}
-
-func read_incoming_messages(conn *net.UDPConn, recv_message chan<- Message) {
-	buf := make([]byte, 65535)
+func get_incoming_messages(conn *net.UDPConn, receive_message_channel chan<- Message) {
+	buf := make([]byte, math.MaxUint16)
 
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
@@ -112,131 +89,100 @@ func read_incoming_messages(conn *net.UDPConn, recv_message chan<- Message) {
 			continue
 		}
 
-		recv_message <- message
-
+		receive_message_channel <- message
 	}
 
 }
 
+var test_rng *rand.Rand
+
+func send_message(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) error {
+	var buf bytes.Buffer
+
+	// NOTE jfd 17/06/26: randomly drop messages
+	if test_rng.Int()%7 == 0 {
+		return nil
+	}
+
+	err := binary.Write(&buf, binary.BigEndian, message)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.WriteToUDP(buf.Bytes(), send_addr)
+
+	return err
+}
+
 func main() {
 
-	// rand_source := rand.NewSource(42)
 	rand_source := rand.NewSource(time.Now().UnixNano())
 	test_rng = rand.New(rand_source)
 
-	window_size := uint32(4)
-	retransmission_timeout := 1500*time.Millisecond
-
-	listen_addr_flag := flag.String("listen", ":9001", "UDP address to listen on")
-	send_addr_flag := flag.String("send", "127.0.0.1:9002", "UDP address to send to")
+	listen_addr_flag := flag.String("listen", ":9001", "-listen <address to listen on>")
+	send_addr_flag := flag.String("send", "127.0.0.1:9002", "-send <address to send on>")
 	flag.Parse()
 
-	listen_addr, err := net.ResolveUDPAddr("udp", *listen_addr_flag)
-	if err != nil {
-		fmt.Println("resolve listen addr:", err)
-		return
-	}
+	fmt.Printf("listening on %s, sending on %s\n", *listen_addr_flag, *send_addr_flag)
 
+	var err error
+
+	listen_addr, err := net.ResolveUDPAddr("udp", *listen_addr_flag)
 	send_addr, err := net.ResolveUDPAddr("udp", *send_addr_flag)
-	if err != nil {
-		fmt.Println("resolve send addr:", err)
-		return
-	}
 
 	conn, err := net.ListenUDP("udp", listen_addr)
 	if err != nil {
-		fmt.Println("listen udp:", err)
-		return
+		log.Fatal("listen failed:", err)
 	}
 	defer conn.Close()
 
-	fmt.Printf("listening on %s, sending to %s\n", listen_addr, send_addr)
-
 	send_message_channel := make(chan Message, 64)
-	recv_message_channel := make(chan Message, 64)
+	receive_message_channel := make(chan Message, 64)
 
-	echo_buffer := make([]byte, 4096)
+	go get_user_input(send_message_channel)
+	go get_incoming_messages(conn, receive_message_channel)
 
-	go read_user_input(send_message_channel)
-	go read_incoming_messages(conn, recv_message_channel)
+	send_message_queue := make([]Message, 0, 128)
+	receive_message_queue := make([]Message, 0, 128) // NOTE jfd 17/06/26: this stores the messages that arrive so that we can join them together once we have a begin and end text message
+	in_flight_messages := make([]Message, 0, 128)
 
-	var (
-		send_queue          []Message
-		receive_buffer      []Message
-		in_flight           []Message
-		window_base_seq_num uint32
-		next_seq_num        uint32
-		expected_seq_num    uint32
+	window_size := 4
+	window_base_seq_num := 0
+	next_seq_num := 0          // next sequence number to use when sending messages
+	next_expected_seq_num := 0 // next sequence number expected by the receiver
+	print_backing_buf := make([]byte, 1024)
 
-		timer *time.Timer
-		timeout_channel <-chan time.Time
-	)
+	var timer *time.Timer
+	var timeout_channel <-chan time.Time
+	timeout_duration := time.Millisecond * 2000
 
+	// NOTE jfd 17/06/26: this timer stuff in go is very confusing
 	stop_timer := func() {
-		if timer == nil {
-			return
-		}
-
-		if !timer.Stop() {
-			select {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
 				case <-timer.C:
 				default:
+				}
 			}
 		}
-
 		timer = nil
 		timeout_channel = nil
 	}
 
 	start_or_reset_timer := func() {
-		if len(in_flight) == 0 {
-			stop_timer()
-			return
-		}
-
-		// start
 		if timer == nil {
-			timer = time.NewTimer(retransmission_timeout)
-			timeout_channel = timer.C
-			return
-		}
-
-		if !timer.Stop() {
-			select {
+			timer = time.NewTimer(timeout_duration)
+		} else {
+			if !timer.Stop() {
+				select {
 				case <-timer.C:
 				default:
+				}
 			}
+			timer.Reset(timeout_duration)
 		}
-
-		timer.Reset(retransmission_timeout)
 		timeout_channel = timer.C
-	}
-
-	fill_window := func() {
-		window_was_empty := (len(in_flight) == 0)
-
-		for len(send_queue) > 0 && uint32(len(in_flight)) < window_size {
-			message := send_queue[0]
-			send_queue = send_queue[1:]
-
-			// NOTE jfd 15/06/26: Seq_num isn't set by read_user_input
-			message.Seq_num = next_seq_num
-
-			if err := send_message(conn, send_addr, message); err != nil {
-				fmt.Fprintln(os.Stderr, "error when sending packet:", err)
-				send_queue = append([]Message{message}, send_queue...)
-				break
-			}
-
-			in_flight = append(in_flight, message)
-			next_seq_num++
-
-		}
-
-		if window_was_empty && len(in_flight) > 0 {
-			start_or_reset_timer()
-		}
-
 	}
 
 	for {
@@ -244,92 +190,117 @@ func main() {
 		received_end_text_message := false
 
 		select {
-
 		case <-timeout_channel:
-			for _,message := range in_flight {
-				if err := send_message(conn, send_addr, message); err != nil {
-					fmt.Fprintln(os.Stderr, "error on retransmit:", err)
-				}
+			if len(in_flight_messages) == 0 {
+				stop_timer()
+			} else {
+				fmt.Printf("\ncowabunga timed out!\n> ")
+				tmp := make([]Message, len(in_flight_messages))
+				copy(tmp, in_flight_messages)
+				send_message_queue = append(tmp, send_message_queue...)
+				in_flight_messages = in_flight_messages[:0]
 			}
-			start_or_reset_timer()
 
 		case message_to_send := <-send_message_channel:
-			send_queue = append(send_queue, message_to_send)
-			fill_window()
+			message_to_send.Seq_num = uint32(next_seq_num)
+			next_seq_num++
+			send_message_queue = append(send_message_queue, message_to_send)
 
-		case message_to_recv := <-recv_message_channel:
+		case message_received := <-receive_message_channel:
+			is_ack := (message_received.Flags&MESSAGE_FLAG_ACK != 0)
 
-			// handle ack
-			if message_to_recv.Flags&MESSAGE_FLAG_ACK != 0 {
+			if is_ack {
 
-				ack_num := message_to_recv.Seq_num
+				ack_num := int(message_received.Seq_num)
 
-				if ack_num > window_base_seq_num && ack_num <= next_seq_num {
+				ack_is_within_the_window := (ack_num >= window_base_seq_num && ack_num <= next_seq_num)
+
+				if ack_is_within_the_window {
 					acknowleged_any_in_flight_messages := false
 
-					for len(in_flight) > 0 && in_flight[0].Seq_num < ack_num {
-						in_flight = in_flight[1:]
+					for len(in_flight_messages) > 0 && in_flight_messages[0].Seq_num <= uint32(ack_num) {
+						in_flight_messages = in_flight_messages[1:]
 						window_base_seq_num++
 						acknowleged_any_in_flight_messages = true
 					}
 
 					if acknowleged_any_in_flight_messages {
-						if len(in_flight) == 0 {
+						if len(in_flight_messages) == 0 {
 							stop_timer()
 						} else {
 							start_or_reset_timer()
 						}
-
-						fill_window()
-
 					}
 
 				}
-
 			} else {
-				// is normal data message
+				seq_num := int(message_received.Seq_num)
 
-				if message_to_recv.Seq_num == expected_seq_num {
-					if message_to_recv.Flags&MESSAGE_FLAG_BEGIN_TEXT != 0 {
-						receive_buffer = receive_buffer[:0]
+				if seq_num == next_expected_seq_num {
+					if message_received.Flags&MESSAGE_FLAG_BEGIN_TEXT != 0 {
+						receive_message_queue = receive_message_queue[:0]
 					}
-					receive_buffer = append(receive_buffer, message_to_recv)
-					expected_seq_num++
-					if message_to_recv.Flags&MESSAGE_FLAG_END_TEXT != 0 {
+
+					receive_message_queue = append(receive_message_queue, message_received)
+					next_expected_seq_num++
+
+					if message_received.Flags&MESSAGE_FLAG_END_TEXT != 0 {
 						received_end_text_message = true
 					}
+					ack_message := Message{
+						Flags:   MESSAGE_FLAG_ACK,
+						Seq_num: message_received.Seq_num,
+					}
+					send_message(conn, send_addr, ack_message)
+				} else {
+					ack_message := Message{
+						Flags:   MESSAGE_FLAG_ACK,
+						Seq_num: uint32(next_expected_seq_num) - 1,
+					}
+					send_message(conn, send_addr, ack_message)
 				}
-
-				ack := Message{
-					Flags:   MESSAGE_FLAG_ACK,
-					Seq_num: expected_seq_num,
-				}
-
-				send_message(conn, send_addr, ack)
 
 			}
 
 		}
 
-		if len(send_queue) > 0 {
-			fill_window()
+		// NOTE jfd 17/06/26: fill the window with messages
+		if len(send_message_queue) > 0 {
+
+			window_was_empty := (len(in_flight_messages) == 0)
+
+			for len(send_message_queue) > 0 && len(in_flight_messages) < window_size {
+				message := send_message_queue[0]
+				send_message_queue = send_message_queue[1:]
+
+				if err := send_message(conn, send_addr, message); err != nil {
+					fmt.Fprintln(os.Stderr, "error while sending message:", err)
+					send_message_queue = append([]Message{message}, send_message_queue...)
+					break
+				}
+
+				in_flight_messages = append(in_flight_messages, message)
+			}
+
+			if window_was_empty && len(in_flight_messages) > 0 {
+				start_or_reset_timer()
+			}
+
 		}
 
 		if received_end_text_message {
-			joined_bytes := echo_buffer[0:]
-
-			for _,m := range receive_buffer {
-				for i := 0; i < len(m.Data); i++ {
-					if m.Data[i] != 0 {
-						joined_bytes = append(joined_bytes, m.Data[i])
-					}
+			text_buf := print_backing_buf[:0]
+			for _, m := range receive_message_queue {
+				text_buf = append(text_buf, m.Data[0])
+				if m.Data[1] != 0 {
+					text_buf = append(text_buf, m.Data[1])
 				}
 			}
 
-			reconstructed_message := string(joined_bytes)
+			fmt.Printf("peer@%s: %s\n", send_addr, string(text_buf))
+			fmt.Print("> ")
 
-			fmt.Printf("\npeer@%s: %s\n", send_addr, reconstructed_message)
-			fmt.Printf("> ")
+			receive_message_queue = receive_message_queue[:0]
 
 		}
 

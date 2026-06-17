@@ -7,7 +7,7 @@
 
 [ignore]
 *tags*
-*.git/**
+./.git/**
 
 [[build commands]]
 build_working_dir:                 .
