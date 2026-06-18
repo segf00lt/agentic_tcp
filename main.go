@@ -29,6 +29,16 @@ type Message struct {
 	Data    [MESSAGE_DATA_SIZE]byte
 }
 
+// TODO jfd 18/06/26: Send metrics to agent
+type Metrics struct {
+	Avg_rtt             time.Duration
+	Rtt_variance        time.Duration
+	Loss_rate           float64
+	Retransmission_rate float64
+	Throughput_bps      float64
+	Window_size         int
+}
+
 func get_user_input(send_message_channel chan<- Message) {
 	input_scanner := bufio.NewScanner(os.Stdin)
 	defer input_scanner.Err()
@@ -146,11 +156,14 @@ func main() {
 	receive_message_queue := make([]Message, 0, 128) // NOTE jfd 17/06/26: this stores the messages that arrive so that we can join them together once we have a begin and end text message
 	in_flight_messages := make([]Message, 0, 128)
 
+	aimd_enabled := true
+	min_window_size := 1
 	window_size := 4
 	window_base_seq_num := 0
 	next_seq_num := 0          // next sequence number to use when sending messages
 	next_expected_seq_num := 0 // next sequence number expected by the receiver
 	print_backing_buf := make([]byte, 1024)
+	count_acks_received := 0
 
 	var timer *time.Timer
 	var timeout_channel <-chan time.Time
@@ -199,6 +212,14 @@ func main() {
 				copy(tmp, in_flight_messages)
 				send_message_queue = append(tmp, send_message_queue...)
 				in_flight_messages = in_flight_messages[:0]
+
+				if aimd_enabled {
+					// NOTE jfd 18/06/26: AIMD
+					window_size = max(min_window_size, window_size/2)
+					count_acks_received = 0
+					fmt.Printf("\nwindow_size = %d, congestion!!!\n", window_size)
+				}
+
 			}
 
 		case message_to_send := <-send_message_channel:
@@ -222,9 +243,21 @@ func main() {
 						in_flight_messages = in_flight_messages[1:]
 						window_base_seq_num++
 						acknowleged_any_in_flight_messages = true
+						count_acks_received++
+					}
+
+					if count_acks_received >= window_size {
+						// NOTE jfd 18/06/26: AIMD
+						if aimd_enabled {
+							window_size++
+						}
+						count_acks_received = 0
 					}
 
 					if acknowleged_any_in_flight_messages {
+
+						fmt.Printf("\nwindow_size = %d, increasing...\n", window_size)
+
 						if len(in_flight_messages) == 0 {
 							stop_timer()
 						} else {
