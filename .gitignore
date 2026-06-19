@@ -1,3 +1,4 @@
 agentic_tcp
 cmd/
 .vscode/*
+*.log
