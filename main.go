@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +14,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/jpoz/groq"
 )
 
 const (
@@ -29,38 +33,37 @@ type Message struct {
 	Data    [MESSAGE_DATA_SIZE]byte
 }
 
-// TODO jfd 18/06/26: Send metrics to agent
 type Metrics struct {
-	Avg_rtt             time.Duration
-	Rtt_variance        time.Duration
-	Loss_rate           float64
-	Retransmission_rate float64
-	Throughput_bps      float64
-	Window_size         int
+	Avg_rtt                float64 `json:"avg_rtt_micro_seconds"`
+	Rtt_variance           float64 `json:"rtt_variance_micro_seconds"`
+	RTO                    float64 `json:"rto_micro_seconds"`
+	Loss_rate              float64 `json:"loss_rate"`
+	Retransmission_rate    float64 `json:"retransmission_rate"`
+	Throughput_bps         float64 `json:"throughput_bps"`
+	Window_size            int     `json:"window_size"`
+	Window_increase_amount int     `json:"window_increase_amount"`
+	Window_decrease_factor float64 `json:"window_decrease_factor"`
 }
 
-func get_user_input(send_message_channel chan<- Message) {
-	input_scanner := bufio.NewScanner(os.Stdin)
-	defer input_scanner.Err()
+type Decision struct {
+	New_window_increase_amount int     `json:"new_window_increase_amount"`
+	New_window_decrease_factor float64 `json:"new_window_decrease_factor"`
+}
 
-	message_buf := make([]Message, 128)
+func send_text_message(text string, send_message_channel chan<- Message) {
+	var message_backing_buf [128]Message
 
-	fmt.Print("> ")
+	n_messages_to_send := int(math.Ceil(float64(len(text)) / float64(MESSAGE_DATA_SIZE)))
 
-	for input_scanner.Scan() {
-		raw := input_scanner.Text()
-		text := strings.TrimRight(raw, "\r\n")
+	n_times := 1
+	if n_messages_to_send > len(message_backing_buf) {
+		n_times = int(math.Ceil(float64(n_messages_to_send) / float64(len(message_backing_buf))))
+	}
 
-		if len(text) == 0 {
-			fmt.Print("> ")
-			continue
-		}
+	text_pos := 0
+	for ; n_times > 0; n_times-- {
+		messages_to_send := message_backing_buf[:0]
 
-		n_messages_to_send := int(math.Ceil(float64(len(text)) / float64(MESSAGE_DATA_SIZE)))
-
-		messages_to_send := message_buf[:0]
-
-		text_pos := 0
 		for range n_messages_to_send {
 
 			message := Message{}
@@ -79,10 +82,47 @@ func get_user_input(send_message_channel chan<- Message) {
 		for _, m := range messages_to_send {
 			send_message_channel <- m
 		}
+	}
+
+}
+
+func get_user_input(send_message_channel chan<- Message) {
+	input_scanner := bufio.NewScanner(os.Stdin)
+	defer input_scanner.Err()
+
+	fmt.Print("> ")
+
+	for input_scanner.Scan() {
+		raw := input_scanner.Text()
+		text := strings.TrimRight(raw, "\r\n")
+
+		if len(text) == 0 {
+			fmt.Print("> ")
+			continue
+		}
+
+		send_text_message(text, send_message_channel)
 
 		fmt.Print("> ")
 
 	}
+}
+
+func get_test_input(send_message_channel chan<- Message) {
+
+	rand_source := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(rand_source)
+
+	for {
+		random_text := strings.Repeat("macaco", 1+rng.Intn(19))
+		log.Printf("sending test message '%s'\n", random_text)
+
+		send_text_message(random_text, send_message_channel)
+
+		random_number_of_seconds := 5 + rng.Intn(12)
+		time.Sleep(time.Second * time.Duration(random_number_of_seconds))
+	}
+
 }
 
 func get_incoming_messages(conn *net.UDPConn, receive_message_channel chan<- Message) {
@@ -106,13 +146,13 @@ func get_incoming_messages(conn *net.UDPConn, receive_message_channel chan<- Mes
 
 var test_rng *rand.Rand
 
-func send_message(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) error {
+func send_message_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) error {
 	var buf bytes.Buffer
 
 	// NOTE jfd 17/06/26: randomly drop messages
-	if test_rng.Int()%7 == 0 {
-		return nil
-	}
+	// if test_rng.Float64() <= 0.1 {
+	// 	return nil
+	// }
 
 	err := binary.Write(&buf, binary.BigEndian, message)
 	if err != nil {
@@ -124,6 +164,63 @@ func send_message(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) er
 	return err
 }
 
+func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision) {
+
+	// NOTE jfd 22/06/26: don't use the LLM if AIMD is enabled
+	if os.Getenv("AIMD_ENABLED") == "1" {
+		return
+	}
+
+	client := groq.NewClient()
+
+	if client == nil {
+		panic("failed to create groq client!!!\n")
+	}
+
+	system_prompt :=
+		`You tune AIMD for throughput. Prefer slightly more aggressive growth unless loss/retransmissions are high. If loss_rate < 0.02 and rtt_variance is low, increase window_increase_amount a bit; if loss_rate > 0.05 or retransmission_rate > 0.10, decrease it. Keep window_decrease_factor near 0.5–0.8, more conservative under loss. Make small changes only. Return only JSON:
+{"new_window_increase_amount":int,"new_window_decrease_factor":float}`
+
+	for metrics := range metrics_channel {
+
+		metrics_json, err := json.Marshal(metrics)
+		if err != nil {
+			// TODO: handle the errors
+			continue
+		}
+		groq_messages := []groq.Message{
+			{
+				Role:    "system",
+				Content: system_prompt,
+			},
+			{
+				Role:    "user",
+				Content: string(metrics_json),
+			},
+		}
+		response, err := client.CreateChatCompletion(groq.CompletionCreateParams{
+			Model:          "llama-3.1-8b-instant",
+			Messages:       groq_messages,
+			ResponseFormat: groq.ResponseFormat{Type: "json_object"},
+		})
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		if len(response.Choices) > 0 {
+			content := response.Choices[0].Message.Content
+			var decision Decision
+			err := json.Unmarshal([]byte(content), &decision)
+			if err != nil {
+				continue
+			}
+			decision_channel <- decision
+		}
+
+	}
+
+}
+
 func exponential_moving_average(avg float64, sample float64, coeficient float64) float64 {
 	result := (1.0-coeficient)*avg + coeficient*sample
 	return result
@@ -132,6 +229,11 @@ func exponential_moving_average(avg float64, sample float64, coeficient float64)
 func main() {
 
 	var err error
+
+	err = godotenv.Load()
+
+	LLM_ENABLED := os.Getenv("LLM_ENABLED")
+	TEST_MODE_ENABLED := os.Getenv("TEST_MODE_ENABLED")
 
 	metrics_log_file, err := os.OpenFile(fmt.Sprintf("metrics%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
@@ -161,11 +263,26 @@ func main() {
 	}
 	defer conn.Close()
 
-	send_message_channel := make(chan Message, 64)
-	receive_message_channel := make(chan Message, 64)
+	send_message_channel := make(chan Message, 128)
+	receive_message_channel := make(chan Message, 128)
 
-	go get_user_input(send_message_channel)
+	metrics_channel := make(chan Metrics, 128)
+	decision_channel := make(chan Decision, 128)
+
+	test_mode_enabled := (TEST_MODE_ENABLED == "1")
+	llm_enabled := (LLM_ENABLED == "1")
+
+	if test_mode_enabled {
+		go get_test_input(send_message_channel)
+	} else {
+		go get_user_input(send_message_channel)
+	}
+
 	go get_incoming_messages(conn, receive_message_channel)
+
+	if llm_enabled {
+		go groq_loop(metrics_channel, decision_channel)
+	}
 
 	send_message_queue := make([]Message, 0, 128)
 	receive_message_queue := make([]Message, 0, 128) // NOTE jfd 17/06/26: this stores the messages that arrive so that we can join them together once we have a begin and end text message
@@ -173,9 +290,8 @@ func main() {
 	in_flight_message_sent_times := make(map[uint32]time.Time)
 
 	// NOTE jfd 19/06/26: tracking metrics for agentic congestion control
-	aimd_enabled := true
-	var average_rtt time.Duration
-	var rtt_variance time.Duration
+	average_rtt := 0.0
+	rtt_variance := 0.0
 	original_transmission_count := 0
 	retransmission_count := 0
 	lost_messages := 0
@@ -183,10 +299,12 @@ func main() {
 	bytes_acked := 0
 	last_time_bytes_acked_was_measured := time.Now()
 	throughput_bps := 0.0
-	metrics_ticker := time.NewTicker(time.Second)
+	metrics_ticker := time.NewTicker(time.Second * 10)
 
 	min_window_size := 1
 	window_size := 4
+	window_increase_amount := 1
+	window_decrease_factor := 0.5
 	window_base_seq_num := 0
 	next_seq_num := 0          // next sequence number to use when sending messages
 	next_expected_seq_num := 0 // next sequence number expected by the receiver
@@ -195,7 +313,7 @@ func main() {
 
 	var timer *time.Timer
 	var timeout_channel <-chan time.Time
-	timeout_duration := time.Millisecond * 2000
+	timeout_duration := time.Millisecond * 400
 
 	// NOTE jfd 17/06/26: this timer stuff in go is very confusing
 	stop_timer := func() {
@@ -234,23 +352,44 @@ func main() {
 
 		case <-metrics_ticker.C:
 
-			elapsed := time.Since(last_time_bytes_acked_was_measured)
-			throughput_sample := 8 * float64(bytes_acked) / elapsed.Seconds()
+			current_metrics_are_valid := (average_rtt > 0.0 &&
+				successfully_acked_messages > 0 &&
+				original_transmission_count > 0)
 
-			throughput_bps = exponential_moving_average(throughput_bps, throughput_sample, 0.125)
-			bytes_acked = 0
-			last_time_bytes_acked_was_measured = time.Now()
+			previous_decision_received := (len(decision_channel) == 0)
 
-			metrics := Metrics{
-				Avg_rtt:             average_rtt,
-				Rtt_variance:        rtt_variance,
-				Loss_rate:           float64(lost_messages) / float64(successfully_acked_messages),
-				Retransmission_rate: float64(retransmission_count) / float64(original_transmission_count),
-				Throughput_bps:      throughput_bps,
-				Window_size:         window_size,
+			if current_metrics_are_valid && previous_decision_received {
+
+				elapsed := time.Since(last_time_bytes_acked_was_measured)
+				throughput_sample := float64(bytes_acked) / elapsed.Seconds()
+
+				throughput_bps = exponential_moving_average(throughput_bps, throughput_sample, 0.125)
+				bytes_acked = 0
+				last_time_bytes_acked_was_measured = time.Now()
+
+				metrics := Metrics{
+					Avg_rtt:                average_rtt,
+					Rtt_variance:           rtt_variance,
+					Loss_rate:              float64(lost_messages) / float64(lost_messages+successfully_acked_messages),
+					Retransmission_rate:    float64(retransmission_count) / float64(retransmission_count+original_transmission_count),
+					Throughput_bps:         throughput_bps,
+					Window_size:            window_size,
+					Window_increase_amount: window_increase_amount,
+					Window_decrease_factor: window_decrease_factor,
+					RTO:                    (average_rtt + 4*rtt_variance),
+				}
+
+				lost_messages = 0
+				successfully_acked_messages = 0
+				retransmission_count = 0
+				original_transmission_count = 0
+
+				log.Printf("%+v\n", metrics)
+
+				if llm_enabled {
+					metrics_channel <- metrics
+				}
 			}
-
-			log.Printf("%+v\n", metrics)
 
 		case <-timeout_channel:
 			if len(in_flight_messages) == 0 {
@@ -272,14 +411,17 @@ func main() {
 
 				in_flight_messages = in_flight_messages[:0]
 
-				if aimd_enabled {
-					// NOTE jfd 18/06/26: AIMD
-					window_size = max(min_window_size, window_size/2)
-					count_acks_received = 0
-					log.Printf("\nwindow_size = %d, congestion!!!\n", window_size)
-				}
+				// NOTE jfd 18/06/26: AIMD
+				window_size = max(min_window_size, int(float64(window_size)*window_decrease_factor))
+				count_acks_received = 0
+				log.Printf("window_size = %d, congestion!!!\n", window_size)
 
 			}
+
+		case decision := <-decision_channel:
+			log.Printf("agent decision: %+v", decision)
+			window_increase_amount = decision.New_window_increase_amount
+			window_decrease_factor = decision.New_window_decrease_factor
 
 		case message_to_send := <-send_message_channel:
 			message_to_send.Seq_num = uint32(next_seq_num)
@@ -304,13 +446,13 @@ func main() {
 					for len(in_flight_messages) > 0 && in_flight_messages[0].Seq_num <= uint32(ack_num) {
 
 						message_acked := in_flight_messages[0]
-						bytes_acked += len(message_acked.Data)
+						bytes_acked += len(message_acked.Data) * 8
 
 						sent_time, ok := in_flight_message_sent_times[message_acked.Seq_num]
 						{
 
 							if ok {
-								sample_rtt := time.Since(sent_time)
+								sample_rtt := float64(time.Since(sent_time)) / float64(time.Microsecond)
 								delete(in_flight_message_sent_times, message_acked.Seq_num)
 
 								// NOTE jfd 19/06/26: init the average and variance
@@ -318,15 +460,11 @@ func main() {
 									average_rtt = sample_rtt
 									rtt_variance = average_rtt / 2
 								} else {
-									average_rtt = time.Duration(
-										exponential_moving_average(float64(average_rtt), float64(sample_rtt), 0.125),
-									)
+									average_rtt = exponential_moving_average(float64(average_rtt), float64(sample_rtt), 0.125)
 
 									diff := math.Abs(float64(sample_rtt - average_rtt))
 
-									rtt_variance = time.Duration(
-										exponential_moving_average(float64(rtt_variance), diff, 0.25),
-									)
+									rtt_variance = exponential_moving_average(float64(rtt_variance), diff, 0.25)
 								}
 							}
 
@@ -342,15 +480,13 @@ func main() {
 
 					if count_acks_received >= window_size {
 						// NOTE jfd 18/06/26: AIMD
-						if aimd_enabled {
-							window_size++
-						}
+						window_size += window_increase_amount
 						count_acks_received = 0
 					}
 
 					if acknowleged_any_in_flight_messages {
 
-						log.Printf("\nwindow_size = %d, increasing...\n", window_size)
+						log.Printf("window_size = %d, increasing...\n", window_size)
 
 						if len(in_flight_messages) == 0 {
 							stop_timer()
@@ -378,13 +514,13 @@ func main() {
 						Flags:   MESSAGE_FLAG_ACK,
 						Seq_num: message_received.Seq_num,
 					}
-					send_message(conn, send_addr, ack_message)
+					send_message_over_udp(conn, send_addr, ack_message)
 				} else {
 					ack_message := Message{
 						Flags:   MESSAGE_FLAG_ACK,
 						Seq_num: uint32(next_expected_seq_num) - 1,
 					}
-					send_message(conn, send_addr, ack_message)
+					send_message_over_udp(conn, send_addr, ack_message)
 				}
 
 			}
@@ -400,7 +536,7 @@ func main() {
 				message := send_message_queue[0]
 				send_message_queue = send_message_queue[1:]
 
-				if err := send_message(conn, send_addr, message); err != nil {
+				if err := send_message_over_udp(conn, send_addr, message); err != nil {
 					fmt.Fprintln(os.Stderr, "error while sending message:", err)
 					send_message_queue = append([]Message{message}, send_message_queue...)
 					break

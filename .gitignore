@@ -1,4 +1,6 @@
 agentic_tcp
 cmd/
+vendor/
 .vscode/*
 *.log
+*.env

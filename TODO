@@ -1,0 +1,19 @@
+
+
+
+
+
+
+
+TODO jfd 20/06/26
+
+
+- Find a way to make 
+- Write test harness
+- Clean up metrics tracking code
+- Do experiments and collect data
+
+
+
+TODO jfd 19/06/26:
+- Send metrics to llm over channel, read responses from llm over channel and adjust window_size
