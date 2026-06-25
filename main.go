@@ -14,35 +14,43 @@ import (
 	"os"
 	"strings"
 	"time"
+	"encoding/csv"
+	"reflect"
+	"strconv"
 
 	"github.com/joho/godotenv"
 	"github.com/jpoz/groq"
 )
 
 const (
-	MESSAGE_FLAG_ACK        = 1 << iota
-	MESSAGE_FLAG_BEGIN_TEXT = 1 << iota
-	MESSAGE_FLAG_END_TEXT   = 1 << iota
+	SEGMENT_FLAG_ACK                = 1 << iota
+	SEGMENT_FLAG_BEGIN_MESSAGE_TEXT = 1 << iota
+	SEGMENT_FLAG_END_MESSAGE_TEXT   = 1 << iota
 )
 
-const MESSAGE_DATA_SIZE = 2
+const SEGMENT_DATA_SIZE = 128
 
-type Message struct {
-	Flags   uint32
-	Seq_num uint32
-	Data    [MESSAGE_DATA_SIZE]byte
+type Segment struct {
+	Flags      uint32
+	Seq_num    uint32
+	Data_len   uint32
+	Data       [SEGMENT_DATA_SIZE]byte
 }
 
 type Metrics struct {
-	Avg_rtt                float64 `json:"avg_rtt_micro_seconds"`
-	Rtt_variance           float64 `json:"rtt_variance_micro_seconds"`
-	RTO                    float64 `json:"rto_micro_seconds"`
-	Loss_rate              float64 `json:"loss_rate"`
-	Retransmission_rate    float64 `json:"retransmission_rate"`
-	Throughput_bps         float64 `json:"throughput_bps"`
-	Window_size            int     `json:"window_size"`
-	Window_increase_amount int     `json:"window_increase_amount"`
-	Window_decrease_factor float64 `json:"window_decrease_factor"`
+	Avg_rtt                           float64 `json:"avg_rtt_micro_seconds"`
+	Rtt_variance                      float64 `json:"rtt_variance_micro_seconds"`
+	EMA_throughput_bits_per_second    float64 `json:"ema_throughput_bits_per_second"`
+	EMA_retransmitted_bits_per_second float64 `json:"ema_retransmitted_bits_per_second"` // NOTE: basically the retransmission rate
+	Raw_throughput_bits_per_second    float64 `json:"raw_throughput_bits_per_second"`
+	Raw_retransmitted_bits_per_second float64 `json:"raw_retransmitted_bits_per_second"`
+	Timeout_interval_milliseconds     float64 `json:"timeout_interval_milliseconds"`
+	Acked_bytes                       int     `json:"acked_bytes"`
+	Retransmitted_bytes               int     `json:"retransmitted_bytes"`
+	Window_size                       int     `json:"window_size"`
+	Slow_start_threshold              int     `json:"slow_start_threshold"`
+	Window_increase_amount            int     `json:"window_increase_amount"`
+	Window_decrease_factor            float64 `json:"window_decrease_factor"`
 }
 
 type Decision struct {
@@ -50,43 +58,386 @@ type Decision struct {
 	New_window_decrease_factor float64 `json:"new_window_decrease_factor"`
 }
 
-func send_text_message(text string, send_message_channel chan<- Message) {
-	var message_backing_buf [128]Message
+func main() {
 
-	n_messages_to_send := int(math.Ceil(float64(len(text)) / float64(MESSAGE_DATA_SIZE)))
+	var err error
+
+	err = godotenv.Load()
+
+	LLM_ENABLED := os.Getenv("LLM_ENABLED")
+	TEST_MODE_ENABLED := os.Getenv("TEST_MODE_ENABLED")
+
+	metrics_csv_path := fmt.Sprintf("metrics%d.csv", os.Getpid())
+
+	log_file, err := os.OpenFile(fmt.Sprintf("%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer log_file.Close()
+
+	log.SetOutput(log_file)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	listen_addr_flag := flag.String("listen", ":9001", "-listen <address to listen on>")
+	send_addr_flag := flag.String("send", "127.0.0.1:9002", "-send <address to send on>")
+	flag.Parse()
+
+	fmt.Printf("listening on %s, sending on %s\n", *listen_addr_flag, *send_addr_flag)
+
+	listen_addr, err := net.ResolveUDPAddr("udp", *listen_addr_flag)
+	send_addr, err := net.ResolveUDPAddr("udp", *send_addr_flag)
+
+	conn, err := net.ListenUDP("udp", listen_addr)
+	if err != nil {
+		log.Fatal("listen failed:", err)
+	}
+	defer conn.Close()
+
+	send_segment_channel := make(chan Segment, 128)
+	receive_segment_channel := make(chan Segment, 128)
+
+	metrics_channel := make(chan Metrics, 128)
+	decision_channel := make(chan Decision, 128)
+
+	send_segment_queue := make([]Segment, 0, 128)
+	receive_segment_queue := make([]Segment, 0, 128) // NOTE jfd 17/06/26: this stores the segments that arrive so that we can join them together once we have a begin and end text segment
+	in_flight_segments := make([]Segment, 0, 128)
+	min_window_size := 1
+	window_size := min_window_size
+	min_slow_start_threshold := 2
+	slow_start_threshold := min_slow_start_threshold
+	count_acks_received := 0
+	window_increase_amount := 1
+	window_decrease_factor := 0.5
+	window_base_seq_num := 0
+	next_seq_num := 0          // next sequence number to use when sending segments
+	next_expected_seq_num := 0 // next sequence number expected by the receiver
+	print_backing_buf := make([]byte, 1<<20)
+	var timer *time.Timer
+	var timeout_channel <-chan time.Time
+	timeout_duration := time.Millisecond * 400
+
+	test_mode_enabled := (TEST_MODE_ENABLED == "1")
+	llm_enabled := (LLM_ENABLED == "1")
+
+	if test_mode_enabled {
+		go get_test_input(send_segment_channel)
+	} else {
+		go get_user_input(send_segment_channel)
+	}
+
+	go get_incoming_segments(conn, receive_segment_channel)
+
+	if llm_enabled {
+		go groq_loop(metrics_channel, decision_channel)
+	}
+
+	// NOTE jfd 19/06/26: tracking metrics for agentic congestion control
+	average_rtt := 0.0
+	rtt_variance := 0.0
+	throughput_bps := 0.0
+	acked_bytes := 0
+	retransmitted_bps := 0.0
+	retransmitted_bytes := 0
+	in_flight_segment_sent_times := make(map[uint32]time.Time)
+	metrics_ticker_duration := time.Second * 1
+	metrics_ticker := time.NewTicker(metrics_ticker_duration)
+
+	// NOTE jfd 17/06/26: this timer stuff in go is very confusing
+	stop_timer := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		timer = nil
+		timeout_channel = nil
+	}
+
+	start_or_reset_timer := func() {
+		if timer == nil {
+			timer = time.NewTimer(timeout_duration)
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout_duration)
+		}
+		timeout_channel = timer.C
+	}
+
+	for {
+
+		received_end_text_segment := false
+
+		select {
+
+		case <-metrics_ticker.C:
+
+			sample_throughput := float64(acked_bytes)*8 / float64(metrics_ticker_duration.Seconds())
+			sample_retransmitted := float64(retransmitted_bytes)*8 / float64(metrics_ticker_duration.Seconds())
+			// alpha := 0.5
+			alpha := 0.125
+			throughput_bps = exponential_moving_average(throughput_bps, sample_throughput, alpha)
+			retransmitted_bps = exponential_moving_average(retransmitted_bps, sample_retransmitted, alpha)
+
+			metrics := Metrics{
+				Avg_rtt:                       average_rtt,
+				Rtt_variance:                  rtt_variance,
+				EMA_throughput_bits_per_second:    throughput_bps,
+				EMA_retransmitted_bits_per_second: retransmitted_bps,
+				Raw_throughput_bits_per_second:    sample_throughput,
+				Raw_retransmitted_bits_per_second: sample_retransmitted,
+				Acked_bytes: 									 acked_bytes,
+				Retransmitted_bytes: 			     retransmitted_bytes,
+				Timeout_interval_milliseconds: float64(timeout_duration) / float64(time.Millisecond),
+				Window_size:                   window_size,
+				Slow_start_threshold:          slow_start_threshold,
+				Window_increase_amount:        window_increase_amount,
+				Window_decrease_factor:        window_decrease_factor,
+			}
+
+			acked_bytes = 0
+			retransmitted_bytes = 0
+
+			current_metrics_are_valid := (average_rtt > 0.0)
+
+			previous_decision_received := (len(decision_channel) == 0)
+
+			go func() {
+				dump_metrics_to_csv(metrics_csv_path, metrics)
+			}()
+
+			if current_metrics_are_valid && previous_decision_received {
+				if llm_enabled {
+					metrics_channel <- metrics
+				}
+			}
+
+		case <-timeout_channel:
+			if len(in_flight_segments) == 0 {
+				stop_timer()
+			} else {
+				log.Println("TIMEOUT")
+
+				tmp := make([]Segment, len(in_flight_segments))
+				copy(tmp, in_flight_segments)
+				send_segment_queue = append(tmp, send_segment_queue...)
+
+				for _, m := range in_flight_segments {
+					retransmitted_bytes += int(m.Data_len)
+					delete(in_flight_segment_sent_times, m.Seq_num)
+				}
+
+				in_flight_segments = in_flight_segments[:0]
+
+				// NOTE jfd 18/06/26: reset window and update slow_start_threshold
+				slow_start_threshold = max(int(float64(window_size) * window_decrease_factor), min_slow_start_threshold)
+				window_size = min_window_size
+				count_acks_received = 0
+
+				log.Printf("window_size = %d, congestion!!!\n", window_size)
+
+			}
+
+		case decision := <-decision_channel:
+			log.Printf("agent decision: %+v", decision)
+			window_increase_amount = decision.New_window_increase_amount
+			window_decrease_factor = decision.New_window_decrease_factor
+
+		case segment_to_send := <-send_segment_channel:
+			segment_to_send.Seq_num = uint32(next_seq_num)
+			next_seq_num++
+			send_segment_queue = append(send_segment_queue, segment_to_send)
+
+		case segment_received := <-receive_segment_channel:
+			is_ack := (segment_received.Flags&SEGMENT_FLAG_ACK != 0)
+
+			if is_ack {
+
+				ack_num := int(segment_received.Seq_num)
+
+				ack_is_within_the_window := (ack_num >= window_base_seq_num && ack_num <= next_seq_num)
+
+				if ack_is_within_the_window {
+					acknowleged_any_in_flight_segments := false
+
+					// NOTE jfd 23/06/26: cumulatively acknowledge segments
+					for len(in_flight_segments) > 0 && in_flight_segments[0].Seq_num <= uint32(ack_num) {
+
+						segment_acked := in_flight_segments[0]
+						acked_bytes += int(segment_acked.Data_len)
+
+						sent_time, ok := in_flight_segment_sent_times[segment_acked.Seq_num]
+						{ // track_average_rtt_and_variance
+
+							if ok {
+								sample_rtt := float64(time.Since(sent_time)) / float64(time.Microsecond)
+								delete(in_flight_segment_sent_times, segment_acked.Seq_num)
+
+								// NOTE jfd 19/06/26: init the average and variance
+								if average_rtt == 0 {
+									average_rtt = sample_rtt
+									rtt_variance = average_rtt / 2
+								} else {
+									average_rtt = exponential_moving_average(float64(average_rtt), float64(sample_rtt), 0.125)
+									diff := math.Abs(float64(sample_rtt - average_rtt))
+									rtt_variance = exponential_moving_average(float64(rtt_variance), diff, 0.25)
+
+									new_timeout_duration := (average_rtt + 4*rtt_variance) * float64(time.Microsecond)
+									timeout_duration = time.Duration(new_timeout_duration)
+								}
+							}
+
+						} // track_average_rtt_and_variance
+
+						in_flight_segments = in_flight_segments[1:]
+						window_base_seq_num++
+						acknowleged_any_in_flight_segments = true
+						if window_size < slow_start_threshold {
+							count_acks_received = 0
+							window_size += window_increase_amount
+						} else {
+							count_acks_received++
+						}
+
+					}
+
+					if count_acks_received >= window_size {
+						// NOTE jfd 18/06/26: AIMD
+						window_size += window_increase_amount
+						count_acks_received = 0
+					}
+
+					if acknowleged_any_in_flight_segments {
+
+						log.Printf("window_size = %d, increasing...\n", window_size)
+
+						if len(in_flight_segments) == 0 {
+							stop_timer()
+						} else {
+							start_or_reset_timer()
+						}
+					}
+
+				}
+			} else {
+				seq_num := int(segment_received.Seq_num)
+
+				if seq_num == next_expected_seq_num {
+					if segment_received.Flags&SEGMENT_FLAG_BEGIN_MESSAGE_TEXT != 0 {
+						receive_segment_queue = receive_segment_queue[:0]
+					}
+
+					receive_segment_queue = append(receive_segment_queue, segment_received)
+					next_expected_seq_num++
+
+					if segment_received.Flags&SEGMENT_FLAG_END_MESSAGE_TEXT != 0 {
+						received_end_text_segment = true
+					}
+					ack_segment := Segment{
+						Flags:   SEGMENT_FLAG_ACK,
+						Seq_num: segment_received.Seq_num,
+					}
+					send_segment_over_udp(conn, send_addr, ack_segment)
+				} else {
+					ack_segment := Segment{
+						Flags:   SEGMENT_FLAG_ACK,
+						Seq_num: uint32(next_expected_seq_num) - 1,
+					}
+					send_segment_over_udp(conn, send_addr, ack_segment)
+				}
+
+			}
+
+		}
+
+		// NOTE jfd 17/06/26: fill the window with segments
+		if len(send_segment_queue) > 0 {
+
+			window_was_empty := (len(in_flight_segments) == 0)
+
+			for len(send_segment_queue) > 0 && len(in_flight_segments) < window_size {
+				segment := send_segment_queue[0]
+				send_segment_queue = send_segment_queue[1:]
+
+				if err := send_segment_over_udp(conn, send_addr, segment); err != nil {
+					fmt.Fprintln(os.Stderr, "error while sending segment:", err)
+					send_segment_queue = append([]Segment{segment}, send_segment_queue...)
+					break
+				}
+				in_flight_segment_sent_times[segment.Seq_num] = time.Now()
+
+				in_flight_segments = append(in_flight_segments, segment)
+			}
+
+			if window_was_empty && len(in_flight_segments) > 0 {
+				start_or_reset_timer()
+			}
+
+		}
+
+		if received_end_text_segment {
+			text_buf := print_backing_buf[:0]
+			for _, m := range receive_segment_queue {
+				text_buf = append(text_buf, m.Data[:m.Data_len]...)
+			}
+
+			fmt.Printf("peer@%s: %s\n", send_addr, string(text_buf))
+			fmt.Print("> ")
+
+			receive_segment_queue = receive_segment_queue[:0]
+
+		}
+
+	}
+
+}
+
+func send_text_message(text string, send_segment_channel chan<- Segment) {
+	var segment_backing_buf [128]Segment
+
+	n_segments_to_send := int(math.Ceil(float64(len(text)) / float64(SEGMENT_DATA_SIZE)))
 
 	n_times := 1
-	if n_messages_to_send > len(message_backing_buf) {
-		n_times = int(math.Ceil(float64(n_messages_to_send) / float64(len(message_backing_buf))))
+	if n_segments_to_send > len(segment_backing_buf) {
+		n_times = int(math.Ceil(float64(n_segments_to_send) / float64(len(segment_backing_buf))))
 	}
 
 	text_pos := 0
 	for ; n_times > 0; n_times-- {
-		messages_to_send := message_backing_buf[:0]
+		segments_to_send := segment_backing_buf[:0]
 
-		for range n_messages_to_send {
+		for range n_segments_to_send {
 
-			message := Message{}
+			segment := Segment{}
 
-			for j := 0; j < MESSAGE_DATA_SIZE && text_pos < len(text); j++ {
-				message.Data[j] = text[text_pos]
+			for j := 0; j < SEGMENT_DATA_SIZE && text_pos < len(text); j++ {
+				segment.Data_len++
+				segment.Data[j] = text[text_pos]
 				text_pos++
 			}
 
-			messages_to_send = append(messages_to_send, message)
+			segments_to_send = append(segments_to_send, segment)
 		}
 
-		messages_to_send[0].Flags |= MESSAGE_FLAG_BEGIN_TEXT
-		messages_to_send[n_messages_to_send-1].Flags |= MESSAGE_FLAG_END_TEXT
+		segments_to_send[0].Flags |= SEGMENT_FLAG_BEGIN_MESSAGE_TEXT
+		segments_to_send[n_segments_to_send-1].Flags |= SEGMENT_FLAG_END_MESSAGE_TEXT
 
-		for _, m := range messages_to_send {
-			send_message_channel <- m
+		for _, m := range segments_to_send {
+			send_segment_channel <- m
 		}
 	}
 
 }
 
-func get_user_input(send_message_channel chan<- Message) {
+func get_user_input(send_segment_channel chan<- Segment) {
 	input_scanner := bufio.NewScanner(os.Stdin)
 	defer input_scanner.Err()
 
@@ -101,31 +452,32 @@ func get_user_input(send_message_channel chan<- Message) {
 			continue
 		}
 
-		send_text_message(text, send_message_channel)
+		send_text_message(text, send_segment_channel)
 
 		fmt.Print("> ")
 
 	}
 }
 
-func get_test_input(send_message_channel chan<- Message) {
+func get_test_input(send_segment_channel chan<- Segment) {
 
 	rand_source := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(rand_source)
 
+	min_random_text_len := 1
+	max_random_text_len := 200
+
 	for {
-		random_text := strings.Repeat("macaco", 1+rng.Intn(19))
-		log.Printf("sending test message '%s'\n", random_text)
+		random_text := strings.Repeat("macaco", max(min_random_text_len, rng.Intn(max_random_text_len)))
+		log.Printf("sending test segment '%s'\n", random_text)
 
-		send_text_message(random_text, send_message_channel)
-
-		random_number_of_seconds := 5 + rng.Intn(12)
-		time.Sleep(time.Second * time.Duration(random_number_of_seconds))
+		send_text_message(random_text, send_segment_channel)
+		time.Sleep(time.Millisecond*10)
 	}
 
 }
 
-func get_incoming_messages(conn *net.UDPConn, receive_message_channel chan<- Message) {
+func get_incoming_segments(conn *net.UDPConn, receive_segment_channel chan<- Segment) {
 	buf := make([]byte, math.MaxUint16)
 
 	for {
@@ -134,27 +486,20 @@ func get_incoming_messages(conn *net.UDPConn, receive_message_channel chan<- Mes
 			continue
 		}
 
-		var message Message
-		if err := binary.Read(bytes.NewReader(buf[:n]), binary.BigEndian, &message); err != nil {
+		var segment Segment
+		if err := binary.Read(bytes.NewReader(buf[:n]), binary.BigEndian, &segment); err != nil {
 			continue
 		}
 
-		receive_message_channel <- message
+		receive_segment_channel <- segment
 	}
 
 }
 
-var test_rng *rand.Rand
-
-func send_message_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, message Message) error {
+func send_segment_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, segment Segment) error {
 	var buf bytes.Buffer
 
-	// NOTE jfd 17/06/26: randomly drop messages
-	// if test_rng.Float64() <= 0.1 {
-	// 	return nil
-	// }
-
-	err := binary.Write(&buf, binary.BigEndian, message)
+	err := binary.Write(&buf, binary.BigEndian, segment)
 	if err != nil {
 		return err
 	}
@@ -188,7 +533,7 @@ func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision)
 			// TODO: handle the errors
 			continue
 		}
-		groq_messages := []groq.Message{
+		groq_segments := []groq.Message{
 			{
 				Role:    "system",
 				Content: system_prompt,
@@ -200,7 +545,7 @@ func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision)
 		}
 		response, err := client.CreateChatCompletion(groq.CompletionCreateParams{
 			Model:          "llama-3.1-8b-instant",
-			Messages:       groq_messages,
+			Messages:       groq_segments,
 			ResponseFormat: groq.ResponseFormat{Type: "json_object"},
 		})
 		if err != nil {
@@ -221,353 +566,70 @@ func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision)
 
 }
 
-func exponential_moving_average(avg float64, sample float64, coeficient float64) float64 {
-	result := (1.0-coeficient)*avg + coeficient*sample
+func exponential_moving_average(avg float64, sample float64, coefficient float64) float64 {
+	result := (1.0-coefficient)*avg + coefficient*sample
 	return result
 }
 
-func main() {
+func dump_metrics_to_csv(path string, m Metrics) error {
+	// check if file exists
+	_, err := os.Stat(path)
+	fileExists := err == nil
 
-	var err error
-
-	err = godotenv.Load()
-
-	LLM_ENABLED := os.Getenv("LLM_ENABLED")
-	TEST_MODE_ENABLED := os.Getenv("TEST_MODE_ENABLED")
-
-	metrics_log_file, err := os.OpenFile(fmt.Sprintf("metrics%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
+	// open file in append mode, create if missing
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer metrics_log_file.Close()
+	defer f.Close()
 
-	log.SetOutput(metrics_log_file)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("======= BEGIN METRICS =======")
+	w := csv.NewWriter(f)
+	defer w.Flush()
 
-	rand_source := rand.NewSource(time.Now().UnixNano())
-	test_rng = rand.New(rand_source)
+	t := reflect.TypeOf(m)
+	v := reflect.ValueOf(m)
 
-	listen_addr_flag := flag.String("listen", ":9001", "-listen <address to listen on>")
-	send_addr_flag := flag.String("send", "127.0.0.1:9002", "-send <address to send on>")
-	flag.Parse()
+	// build header + row
+	header := make([]string, 0, t.NumField())
+	row := make([]string, 0, t.NumField())
 
-	fmt.Printf("listening on %s, sending on %s\n", *listen_addr_flag, *send_addr_flag)
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
 
-	listen_addr, err := net.ResolveUDPAddr("udp", *listen_addr_flag)
-	send_addr, err := net.ResolveUDPAddr("udp", *send_addr_flag)
-
-	conn, err := net.ListenUDP("udp", listen_addr)
-	if err != nil {
-		log.Fatal("listen failed:", err)
-	}
-	defer conn.Close()
-
-	send_message_channel := make(chan Message, 128)
-	receive_message_channel := make(chan Message, 128)
-
-	metrics_channel := make(chan Metrics, 128)
-	decision_channel := make(chan Decision, 128)
-
-	test_mode_enabled := (TEST_MODE_ENABLED == "1")
-	llm_enabled := (LLM_ENABLED == "1")
-
-	if test_mode_enabled {
-		go get_test_input(send_message_channel)
-	} else {
-		go get_user_input(send_message_channel)
-	}
-
-	go get_incoming_messages(conn, receive_message_channel)
-
-	if llm_enabled {
-		go groq_loop(metrics_channel, decision_channel)
-	}
-
-	send_message_queue := make([]Message, 0, 128)
-	receive_message_queue := make([]Message, 0, 128) // NOTE jfd 17/06/26: this stores the messages that arrive so that we can join them together once we have a begin and end text message
-	in_flight_messages := make([]Message, 0, 128)
-	in_flight_message_sent_times := make(map[uint32]time.Time)
-
-	// NOTE jfd 19/06/26: tracking metrics for agentic congestion control
-	average_rtt := 0.0
-	rtt_variance := 0.0
-	original_transmission_count := 0
-	retransmission_count := 0
-	lost_messages := 0
-	successfully_acked_messages := 0
-	bytes_acked := 0
-	last_time_bytes_acked_was_measured := time.Now()
-	throughput_bps := 0.0
-	metrics_ticker := time.NewTicker(time.Second * 10)
-
-	min_window_size := 1
-	window_size := 4
-	window_increase_amount := 1
-	window_decrease_factor := 0.5
-	window_base_seq_num := 0
-	next_seq_num := 0          // next sequence number to use when sending messages
-	next_expected_seq_num := 0 // next sequence number expected by the receiver
-	print_backing_buf := make([]byte, 1024)
-	count_acks_received := 0
-
-	var timer *time.Timer
-	var timeout_channel <-chan time.Time
-	timeout_duration := time.Millisecond * 400
-
-	// NOTE jfd 17/06/26: this timer stuff in go is very confusing
-	stop_timer := func() {
-		if timer != nil {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-		}
-		timer = nil
-		timeout_channel = nil
-	}
-
-	start_or_reset_timer := func() {
-		if timer == nil {
-			timer = time.NewTimer(timeout_duration)
+		tag := field.Tag.Get("json")
+		if tag == "" {
+			tag = field.Name
 		} else {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(timeout_duration)
+			tag = strings.Split(tag, ",")[0]
 		}
-		timeout_channel = timer.C
+
+		header = append(header, tag)
+
+		val := v.Field(i)
+
+		switch val.Kind() {
+		case reflect.Float64:
+			row = append(row, strconv.FormatFloat(val.Float(), 'f', -1, 64))
+		case reflect.Int, reflect.Int64, reflect.Int32:
+			row = append(row, strconv.FormatInt(val.Int(), 10))
+		default:
+			row = append(row, "")
+		}
 	}
 
-	for {
-
-		received_end_text_message := false
-
-		select {
-
-		case <-metrics_ticker.C:
-
-			current_metrics_are_valid := (average_rtt > 0.0 &&
-				successfully_acked_messages > 0 &&
-				original_transmission_count > 0)
-
-			previous_decision_received := (len(decision_channel) == 0)
-
-			if current_metrics_are_valid && previous_decision_received {
-
-				elapsed := time.Since(last_time_bytes_acked_was_measured)
-				throughput_sample := float64(bytes_acked) / elapsed.Seconds()
-
-				throughput_bps = exponential_moving_average(throughput_bps, throughput_sample, 0.125)
-				bytes_acked = 0
-				last_time_bytes_acked_was_measured = time.Now()
-
-				metrics := Metrics{
-					Avg_rtt:                average_rtt,
-					Rtt_variance:           rtt_variance,
-					Loss_rate:              float64(lost_messages) / float64(lost_messages+successfully_acked_messages),
-					Retransmission_rate:    float64(retransmission_count) / float64(retransmission_count+original_transmission_count),
-					Throughput_bps:         throughput_bps,
-					Window_size:            window_size,
-					Window_increase_amount: window_increase_amount,
-					Window_decrease_factor: window_decrease_factor,
-					RTO:                    (average_rtt + 4*rtt_variance),
-				}
-
-				lost_messages = 0
-				successfully_acked_messages = 0
-				retransmission_count = 0
-				original_transmission_count = 0
-
-				log.Printf("%+v\n", metrics)
-
-				if llm_enabled {
-					metrics_channel <- metrics
-				}
-			}
-
-		case <-timeout_channel:
-			if len(in_flight_messages) == 0 {
-				stop_timer()
-			} else {
-				log.Println("TIMEOUT")
-
-				tmp := make([]Message, len(in_flight_messages))
-				copy(tmp, in_flight_messages)
-				send_message_queue = append(tmp, send_message_queue...)
-
-				for _, m := range in_flight_messages {
-					delete(in_flight_message_sent_times, m.Seq_num)
-				}
-
-				// TODO: put this in a struct
-				lost_messages += len(in_flight_messages)
-				retransmission_count += len(in_flight_messages)
-
-				in_flight_messages = in_flight_messages[:0]
-
-				// NOTE jfd 18/06/26: AIMD
-				window_size = max(min_window_size, int(float64(window_size)*window_decrease_factor))
-				count_acks_received = 0
-				log.Printf("window_size = %d, congestion!!!\n", window_size)
-
-			}
-
-		case decision := <-decision_channel:
-			log.Printf("agent decision: %+v", decision)
-			window_increase_amount = decision.New_window_increase_amount
-			window_decrease_factor = decision.New_window_decrease_factor
-
-		case message_to_send := <-send_message_channel:
-			message_to_send.Seq_num = uint32(next_seq_num)
-			next_seq_num++
-			send_message_queue = append(send_message_queue, message_to_send)
-
-			// TODO: put this in a struct
-			original_transmission_count++
-
-		case message_received := <-receive_message_channel:
-			is_ack := (message_received.Flags&MESSAGE_FLAG_ACK != 0)
-
-			if is_ack {
-
-				ack_num := int(message_received.Seq_num)
-
-				ack_is_within_the_window := (ack_num >= window_base_seq_num && ack_num <= next_seq_num)
-
-				if ack_is_within_the_window {
-					acknowleged_any_in_flight_messages := false
-
-					for len(in_flight_messages) > 0 && in_flight_messages[0].Seq_num <= uint32(ack_num) {
-
-						message_acked := in_flight_messages[0]
-						bytes_acked += len(message_acked.Data) * 8
-
-						sent_time, ok := in_flight_message_sent_times[message_acked.Seq_num]
-						{
-
-							if ok {
-								sample_rtt := float64(time.Since(sent_time)) / float64(time.Microsecond)
-								delete(in_flight_message_sent_times, message_acked.Seq_num)
-
-								// NOTE jfd 19/06/26: init the average and variance
-								if average_rtt == 0 {
-									average_rtt = sample_rtt
-									rtt_variance = average_rtt / 2
-								} else {
-									average_rtt = exponential_moving_average(float64(average_rtt), float64(sample_rtt), 0.125)
-
-									diff := math.Abs(float64(sample_rtt - average_rtt))
-
-									rtt_variance = exponential_moving_average(float64(rtt_variance), diff, 0.25)
-								}
-							}
-
-							// TODO: put this in a struct
-							successfully_acked_messages++
-						}
-
-						in_flight_messages = in_flight_messages[1:]
-						window_base_seq_num++
-						acknowleged_any_in_flight_messages = true
-						count_acks_received++
-					}
-
-					if count_acks_received >= window_size {
-						// NOTE jfd 18/06/26: AIMD
-						window_size += window_increase_amount
-						count_acks_received = 0
-					}
-
-					if acknowleged_any_in_flight_messages {
-
-						log.Printf("window_size = %d, increasing...\n", window_size)
-
-						if len(in_flight_messages) == 0 {
-							stop_timer()
-						} else {
-							start_or_reset_timer()
-						}
-					}
-
-				}
-			} else {
-				seq_num := int(message_received.Seq_num)
-
-				if seq_num == next_expected_seq_num {
-					if message_received.Flags&MESSAGE_FLAG_BEGIN_TEXT != 0 {
-						receive_message_queue = receive_message_queue[:0]
-					}
-
-					receive_message_queue = append(receive_message_queue, message_received)
-					next_expected_seq_num++
-
-					if message_received.Flags&MESSAGE_FLAG_END_TEXT != 0 {
-						received_end_text_message = true
-					}
-					ack_message := Message{
-						Flags:   MESSAGE_FLAG_ACK,
-						Seq_num: message_received.Seq_num,
-					}
-					send_message_over_udp(conn, send_addr, ack_message)
-				} else {
-					ack_message := Message{
-						Flags:   MESSAGE_FLAG_ACK,
-						Seq_num: uint32(next_expected_seq_num) - 1,
-					}
-					send_message_over_udp(conn, send_addr, ack_message)
-				}
-
-			}
-
+	// write header only if file didn't exist
+	if !fileExists {
+		if err := w.Write(header); err != nil {
+			return err
 		}
-
-		// NOTE jfd 17/06/26: fill the window with messages
-		if len(send_message_queue) > 0 {
-
-			window_was_empty := (len(in_flight_messages) == 0)
-
-			for len(send_message_queue) > 0 && len(in_flight_messages) < window_size {
-				message := send_message_queue[0]
-				send_message_queue = send_message_queue[1:]
-
-				if err := send_message_over_udp(conn, send_addr, message); err != nil {
-					fmt.Fprintln(os.Stderr, "error while sending message:", err)
-					send_message_queue = append([]Message{message}, send_message_queue...)
-					break
-				}
-				in_flight_message_sent_times[message.Seq_num] = time.Now()
-
-				in_flight_messages = append(in_flight_messages, message)
-			}
-
-			if window_was_empty && len(in_flight_messages) > 0 {
-				start_or_reset_timer()
-			}
-
-		}
-
-		if received_end_text_message {
-			text_buf := print_backing_buf[:0]
-			for _, m := range receive_message_queue {
-				text_buf = append(text_buf, m.Data[0])
-				if m.Data[1] != 0 {
-					text_buf = append(text_buf, m.Data[1])
-				}
-			}
-
-			fmt.Printf("peer@%s: %s\n", send_addr, string(text_buf))
-			fmt.Print("> ")
-
-			receive_message_queue = receive_message_queue[:0]
-
-		}
-
 	}
 
+	// always append row
+	if err := w.Write(row); err != nil {
+		return err
+	}
+
+	w.Flush()
+	return w.Error()
 }
+

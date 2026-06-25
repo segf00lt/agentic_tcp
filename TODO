@@ -5,15 +5,67 @@
 
 
 
-TODO jfd 20/06/26
 
 
-- Find a way to make 
-- Write test harness
+
+
+TODO 25/06/26
+
+- Define separate metrics for llm and profiling metrics
+- API for generating test traffic at a particular bitrate
+- Experiment with llm
+- Setup test benches so we can run benchmarks easily
+  - The tests should also test with some different simulated conditions (wifi simulation, sattelite, etc.)
+  - The parameters for the EMAs should be tunable, as well as bitrate for the test, profiling frequency, etc.
+- Realtime benchmark graphs???
 - Clean up metrics tracking code
-- Do experiments and collect data
 
 
 
-TODO jfd 19/06/26:
-- Send metrics to llm over channel, read responses from llm over channel and adjust window_size
+TODO 24/06/26
+- DONE Write test harness
+- DONE Do experiments and collect data
+
+NOTE 24/06/26
+
+From https://arxiv.org/html/2604.03857v1
+
+An essential design question is determining when to invoke the LLM to adjust
+CWND. This requires a trigger module that continuously monitors network
+conditions and decides whether an adjustment should be applied. In conventional
+loss-based congestion control algorithms such as TCP-NewReno, congestion is
+detected through packet loss signals. However, these signals are inherently
+delayed, as the receipt of 3-duplicate ACKs indicates that congestion has
+already occurred. To enable earlier intervention, we adopt a latency-based
+approach inspired by existing delay-sensitive congestion control schemes (e.g.,
+Bbr [6]), which treat RTT growth as an early indicator of congestion rather
+than waiting for loss. Specifically, we monitor the latency of the most
+recently sent segment, and if it exceeds a predefined threshold, we trigger the
+LLM to adjust CWND.
+
+
+
+
+| Field                       | Simple meaning                                                         |
+| --------------------------- | ---------------------------------------------------------------------- |
+| `tcpi_rcv_ssthresh`         | Receive-side slow-start threshold; a receive-window/auto-tuning limit. |
+| `tcpi_rtt`                  | Smoothed round-trip time estimate, in microseconds.                    |
+| `tcpi_rttvar`               | RTT variation / jitter estimate.                                       |
+| `tcpi_snd_ssthresh`         | Send-side slow-start threshold.                                        |
+| `tcpi_snd_cwnd`             | Current send congestion window (`cwnd`).                               |
+| `tcpi_rcv_rtt`              | Receive-side RTT estimate used by the kernel.                          |
+| `tcpi_total_retrans`        | Total retransmissions on this connection.                              |
+| `tcpi_bytes_acked`          | Total application bytes acknowledged by the peer.                      |
+| `tcpi_bytes_received`       | Total application bytes received from the peer.                        |
+| `tcpi_segs_out`             | Total TCP segments sent.                                               |
+| `tcpi_segs_in`              | Total TCP segments received.                                           |
+| `tcpi_data_segs_in`         | Data segments received (not just control packets).                     |
+| `tcpi_data_segs_out`        | Data segments sent (not just control packets).                         |
+| `tcpi_delivery_rate`        | Estimated delivery throughput, bytes/sec.                              |
+| `tcpi_delivered`            | Number of packets/segments delivered to the peer as tracked by TCP.    |
+| `tcpi_bytes_sent`           | Total bytes sent, including retransmissions.                           |
+| `tcpi_bytes_retrans`        | Total bytes retransmitted.                                             |
+
+
+TODO 19/06/26:
+- DONE Send metrics to llm over channel, read responses from llm over channel and adjust window_size

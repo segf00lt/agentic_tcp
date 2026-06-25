@@ -8,6 +8,8 @@
 [ignore]
 *tags*
 ./.git/**
+./vendor/**
+*.log
 
 [[build commands]]
 build_working_dir:                 .
@@ -18,7 +20,7 @@ auto_jump_to_error:                true
 error_regex:                       ^(?P<file>.*):(?P<line>\d+):(?P<col>\d+): (?P<msg>.*)$
 
 [build]
-build_command: build.sh
+build_command: go build
 key_binding: F9
 
 [debug]
