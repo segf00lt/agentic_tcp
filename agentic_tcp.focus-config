@@ -10,6 +10,7 @@
 ./.git/**
 ./vendor/**
 *.log
+*.csv
 
 [[build commands]]
 build_working_dir:                 .
@@ -30,9 +31,6 @@ key_binding: F11
 [terminal]
 run_command: %BUILD_WORKING_DIR%/terminal.sh
 key_binding: F7
-
-[seed]
-run_command: go run cmd/seed.go
 
 
 [[settings]]

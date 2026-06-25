@@ -28,7 +28,7 @@ const (
 	SEGMENT_FLAG_END_MESSAGE_TEXT   = 1 << iota
 )
 
-const SEGMENT_DATA_SIZE = 128
+const SEGMENT_DATA_SIZE = 8
 
 type Segment struct {
 	Flags      uint32
@@ -37,25 +37,36 @@ type Segment struct {
 	Data       [SEGMENT_DATA_SIZE]byte
 }
 
-type Metrics struct {
+type LLM_metrics struct {
+	Avg_rtt                           float64 `json:"avg_rtt_us"`
+	Rtt_variance                      float64 `json:"rtt_variance_us"`
+	Throughput_ema_bps    						float64 `json:"throughput_ema_bps"`
+	Prev_throughput_ema_bps    				float64 `json:"prev_throughput_ema_bps"`
+	Retransmission_ratio_ema 	   	    float64 `json:"retransmission_ratio_ema"`
+	Prev_retransmission_ratio_ema 	  float64 `json:"prev_retransmission_ratio_ema"`
+	Cwnd                              int     `json:"cwnd"`
+	Ssthresh                          int     `json:"ssthresh"`
+	Prev_cwnd                         int     `json:"prev_cwnd"`
+	Prev_ssthresh                     int     `json:"prev_ssthresh"`
+}
+
+type Profile_metrics struct {
 	Avg_rtt                           float64 `json:"avg_rtt_micro_seconds"`
 	Rtt_variance                      float64 `json:"rtt_variance_micro_seconds"`
-	EMA_throughput_bits_per_second    float64 `json:"ema_throughput_bits_per_second"`
-	EMA_retransmitted_bits_per_second float64 `json:"ema_retransmitted_bits_per_second"` // NOTE: basically the retransmission rate
-	Raw_throughput_bits_per_second    float64 `json:"raw_throughput_bits_per_second"`
-	Raw_retransmitted_bits_per_second float64 `json:"raw_retransmitted_bits_per_second"`
+	EMA_throughput_bps                float64 `json:"ema_throughput_bps"`
+	EMA_retransmission_ratio_bps      float64 `json:"ema_retransmission_ratio_bps"`
+	Raw_throughput_bps                float64 `json:"raw_throughput_bps"`
+	Raw_retransmission_ratio_bps      float64 `json:"raw_retransmission_ratio_bps"`
 	Timeout_interval_milliseconds     float64 `json:"timeout_interval_milliseconds"`
 	Acked_bytes                       int     `json:"acked_bytes"`
-	Retransmitted_bytes               int     `json:"retransmitted_bytes"`
+	Retransmitted_bytes               int     `json:"total_bytes_retransmitted"`
 	Window_size                       int     `json:"window_size"`
 	Slow_start_threshold              int     `json:"slow_start_threshold"`
-	Window_increase_amount            int     `json:"window_increase_amount"`
-	Window_decrease_factor            float64 `json:"window_decrease_factor"`
 }
 
 type Decision struct {
-	New_window_increase_amount int     `json:"new_window_increase_amount"`
-	New_window_decrease_factor float64 `json:"new_window_decrease_factor"`
+	New_cwnd                   int     `json:"new_cwnd"`
+	New_ssthresh               int     `json:"new_sshresh"`
 }
 
 func main() {
@@ -64,10 +75,52 @@ func main() {
 
 	err = godotenv.Load()
 
-	LLM_ENABLED := os.Getenv("LLM_ENABLED")
-	TEST_MODE_ENABLED := os.Getenv("TEST_MODE_ENABLED")
+	var (
+		test_traffic_delay_interval time.Duration
+		test_traffic_bits_to_send int
+		test_traffic_bitrate_bps int
+		profile_metrics_name_prefix string
+		profile_interval time.Duration
+	)
 
-	metrics_csv_path := fmt.Sprintf("metrics%d.csv", os.Getpid())
+	LLM_ENABLED                 := os.Getenv("LLM_ENABLED")
+	TEST_MODE_ENABLED           := os.Getenv("TEST_MODE_ENABLED")
+	TEST_TRAFFIC_BITRATE_BPS    := os.Getenv("TEST_TRAFFIC_BITRATE_BPS")
+	TEST_TRAFFIC_DELAY_INTERVAL := os.Getenv("TEST_TRAFFIC_DELAY_INTERVAL")
+	TEST_TRAFFIC_BITS_TO_SEND   := os.Getenv("TEST_TRAFFIC_BITS_TO_SEND")
+	PROFILE_METRICS_NAME_PREFIX := os.Getenv("PROFILE_METRICS_NAME_PREFIX")
+	PROFILE_INTERVAL 						:= os.Getenv("PROFILE_INTERVAL")
+
+	if TEST_TRAFFIC_DELAY_INTERVAL != "" {
+		test_traffic_delay_interval, err = time.ParseDuration(TEST_TRAFFIC_DELAY_INTERVAL)
+		if err != nil { panic(err) }
+	}
+
+	if TEST_TRAFFIC_BITS_TO_SEND != "" {
+		test_traffic_bits_to_send, err = strconv.Atoi(TEST_TRAFFIC_BITS_TO_SEND)
+		if err != nil { panic(err) }
+	}
+
+	if TEST_TRAFFIC_BITRATE_BPS != "" {
+		test_traffic_bitrate_bps, err = strconv.Atoi(TEST_TRAFFIC_BITRATE_BPS)
+		if err != nil { panic(err) }
+		if test_traffic_bitrate_bps == 0 {}
+	}
+
+	if PROFILE_METRICS_NAME_PREFIX == "" {
+		profile_metrics_name_prefix = "metrics_"
+	} else {
+		profile_metrics_name_prefix = PROFILE_METRICS_NAME_PREFIX
+	}
+
+	if PROFILE_INTERVAL != "" {
+		profile_interval, err = time.ParseDuration(PROFILE_INTERVAL)
+		if err != nil { panic(err) }
+	} else {
+		profile_interval = time.Second * 1
+	}
+
+	profile_metrics_csv_path := fmt.Sprintf("%s%d.csv", profile_metrics_name_prefix, os.Getpid())
 
 	log_file, err := os.OpenFile(fmt.Sprintf("%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
@@ -96,17 +149,19 @@ func main() {
 	send_segment_channel := make(chan Segment, 128)
 	receive_segment_channel := make(chan Segment, 128)
 
-	metrics_channel := make(chan Metrics, 128)
+	llm_metrics_channel := make(chan LLM_metrics, 128)
 	decision_channel := make(chan Decision, 128)
 
 	send_segment_queue := make([]Segment, 0, 128)
-	receive_segment_queue := make([]Segment, 0, 128) // NOTE jfd 17/06/26: this stores the segments that arrive so that we can join them together once we have a begin and end text segment
+	receive_segment_queue := make([]Segment, 0, 128) // NOTE 17/06/26: this stores the segments that arrive so that we can join them together once we have a begin and end text segment
 	in_flight_segments := make([]Segment, 0, 128)
 	min_window_size := 1
 	window_size := min_window_size
+	prev_window_size := window_size
 	min_slow_start_threshold := 2
 	slow_start_threshold := min_slow_start_threshold
-	count_acks_received := 0
+	prev_slow_start_threshold := slow_start_threshold
+	count_in_order_acks_received := 0
 	window_increase_amount := 1
 	window_decrease_factor := 0.5
 	window_base_seq_num := 0
@@ -121,7 +176,7 @@ func main() {
 	llm_enabled := (LLM_ENABLED == "1")
 
 	if test_mode_enabled {
-		go get_test_input(send_segment_channel)
+		go generate_test_traffic(test_traffic_bits_to_send, test_traffic_delay_interval, send_segment_channel)
 	} else {
 		go get_user_input(send_segment_channel)
 	}
@@ -129,21 +184,28 @@ func main() {
 	go get_incoming_segments(conn, receive_segment_channel)
 
 	if llm_enabled {
-		go groq_loop(metrics_channel, decision_channel)
+		go groq_loop(llm_metrics_channel, decision_channel)
 	}
 
-	// NOTE jfd 19/06/26: tracking metrics for agentic congestion control
+	// NOTE 19/06/26: tracking metrics for profiling and agentic congestion control
 	average_rtt := 0.0
 	rtt_variance := 0.0
-	throughput_bps := 0.0
+	throughput_ema := 0.0
 	acked_bytes := 0
-	retransmitted_bps := 0.0
-	retransmitted_bytes := 0
+	retransmission_ratio_ema := 0.0
+	total_bytes_retransmitted := 0
+	total_bytes_transmitted := 0
 	in_flight_segment_sent_times := make(map[uint32]time.Time)
-	metrics_ticker_duration := time.Second * 1
-	metrics_ticker := time.NewTicker(metrics_ticker_duration)
+	profile_metrics_ticker_duration := profile_interval
+	profile_metrics_ticker := time.NewTicker(profile_metrics_ticker_duration)
 
-	// NOTE jfd 17/06/26: this timer stuff in go is very confusing
+	raw_ack_threshold_computed := false
+	count_raw_acks_received := 0
+	raw_ack_threshold := 0
+	raw_ack_count_ticker := time.NewTicker(time.Second * 10)
+	invoke_llm := false
+
+	// NOTE 17/06/26: this timer stuff in go is very confusing
 	stop_timer := func() {
 		if timer != nil {
 			if !timer.Stop() {
@@ -178,47 +240,71 @@ func main() {
 
 		select {
 
-		case <-metrics_ticker.C:
+		case <-raw_ack_count_ticker.C:
+			raw_ack_threshold_computed = true
+			raw_ack_threshold = count_raw_acks_received / 10
 
-			sample_throughput := float64(acked_bytes)*8 / float64(metrics_ticker_duration.Seconds())
-			sample_retransmitted := float64(retransmitted_bytes)*8 / float64(metrics_ticker_duration.Seconds())
-			// alpha := 0.5
+		case <-profile_metrics_ticker.C:
+
+			sample_throughput := float64(acked_bytes)*8 / float64(profile_metrics_ticker_duration.Seconds())
+			sample_retransmission_ratio := float64(total_bytes_retransmitted) / float64(total_bytes_transmitted)
 			alpha := 0.125
-			throughput_bps = exponential_moving_average(throughput_bps, sample_throughput, alpha)
-			retransmitted_bps = exponential_moving_average(retransmitted_bps, sample_retransmitted, alpha)
+			prev_throughput_ema := throughput_ema
+			prev_retransmission_ratio_ema := retransmission_ratio_ema
+			throughput_ema = exponential_moving_average(throughput_ema, sample_throughput, alpha)
+			retransmission_ratio_ema = exponential_moving_average(retransmission_ratio_ema, sample_retransmission_ratio, alpha)
 
-			metrics := Metrics{
-				Avg_rtt:                       average_rtt,
-				Rtt_variance:                  rtt_variance,
-				EMA_throughput_bits_per_second:    throughput_bps,
-				EMA_retransmitted_bits_per_second: retransmitted_bps,
-				Raw_throughput_bits_per_second:    sample_throughput,
-				Raw_retransmitted_bits_per_second: sample_retransmitted,
-				Acked_bytes: 									 acked_bytes,
-				Retransmitted_bytes: 			     retransmitted_bytes,
-				Timeout_interval_milliseconds: float64(timeout_duration) / float64(time.Millisecond),
-				Window_size:                   window_size,
-				Slow_start_threshold:          slow_start_threshold,
-				Window_increase_amount:        window_increase_amount,
-				Window_decrease_factor:        window_decrease_factor,
+			metrics := Profile_metrics{
+				Avg_rtt:                           average_rtt,
+				Rtt_variance:                      rtt_variance,
+				EMA_throughput_bps:                throughput_ema,
+				EMA_retransmission_ratio_bps:      retransmission_ratio_ema,
+				Raw_throughput_bps:                sample_throughput,
+				Raw_retransmission_ratio_bps:      sample_retransmission_ratio,
+				Acked_bytes: 									     acked_bytes,
+				Retransmitted_bytes: 			         total_bytes_retransmitted,
+				Timeout_interval_milliseconds:     float64(timeout_duration) / float64(time.Millisecond),
+				Window_size:                       window_size,
+				Slow_start_threshold:              slow_start_threshold,
 			}
 
 			acked_bytes = 0
-			retransmitted_bytes = 0
-
-			current_metrics_are_valid := (average_rtt > 0.0)
-
-			previous_decision_received := (len(decision_channel) == 0)
+			total_bytes_retransmitted = 0
+			total_bytes_transmitted = 0
 
 			go func() {
-				dump_metrics_to_csv(metrics_csv_path, metrics)
+				dump_metrics_to_csv(profile_metrics_csv_path, metrics)
 			}()
 
-			if current_metrics_are_valid && previous_decision_received {
-				if llm_enabled {
-					metrics_channel <- metrics
+			// TODO: come up with a condition to trigger the LLM on apart from periodic triggering
+			if invoke_llm {
+				invoke_llm = false
+
+				llm_metrics := LLM_metrics{
+					Avg_rtt: average_rtt,
+					Rtt_variance: rtt_variance,
+					Throughput_ema_bps: throughput_ema,
+					Prev_throughput_ema_bps: prev_throughput_ema,
+					Retransmission_ratio_ema: retransmission_ratio_ema,
+					Prev_retransmission_ratio_ema: prev_retransmission_ratio_ema,
+					Cwnd: window_size,
+					Ssthresh: slow_start_threshold,
+					Prev_cwnd: prev_window_size,
+					Prev_ssthresh: prev_slow_start_threshold,
 				}
+
+				llm_metrics_channel <- llm_metrics
 			}
+
+			// current_metrics_are_valid := (average_rtt > 0.0)
+
+			// previous_decision_received := (len(decision_channel) == 0)
+
+			// if current_metrics_are_valid && previous_decision_received {
+			// 	if llm_enabled {
+			// 		metrics_channel <- metrics
+			// 	}
+			// }
 
 		case <-timeout_channel:
 			if len(in_flight_segments) == 0 {
@@ -231,16 +317,16 @@ func main() {
 				send_segment_queue = append(tmp, send_segment_queue...)
 
 				for _, m := range in_flight_segments {
-					retransmitted_bytes += int(m.Data_len)
+					total_bytes_retransmitted += int(m.Data_len)
 					delete(in_flight_segment_sent_times, m.Seq_num)
 				}
 
 				in_flight_segments = in_flight_segments[:0]
 
-				// NOTE jfd 18/06/26: reset window and update slow_start_threshold
+				// NOTE 18/06/26: reset window and update slow_start_threshold
 				slow_start_threshold = max(int(float64(window_size) * window_decrease_factor), min_slow_start_threshold)
 				window_size = min_window_size
-				count_acks_received = 0
+				count_in_order_acks_received = 0
 
 				log.Printf("window_size = %d, congestion!!!\n", window_size)
 
@@ -248,8 +334,8 @@ func main() {
 
 		case decision := <-decision_channel:
 			log.Printf("agent decision: %+v", decision)
-			window_increase_amount = decision.New_window_increase_amount
-			window_decrease_factor = decision.New_window_decrease_factor
+			window_size = decision.New_cwnd
+			slow_start_threshold = decision.New_ssthresh
 
 		case segment_to_send := <-send_segment_channel:
 			segment_to_send.Seq_num = uint32(next_seq_num)
@@ -261,6 +347,14 @@ func main() {
 
 			if is_ack {
 
+				if raw_ack_threshold_computed {
+					count_raw_acks_received++
+					if count_raw_acks_received >= raw_ack_threshold {
+						invoke_llm = true
+						count_raw_acks_received = 0
+					}
+				}
+
 				ack_num := int(segment_received.Seq_num)
 
 				ack_is_within_the_window := (ack_num >= window_base_seq_num && ack_num <= next_seq_num)
@@ -268,7 +362,7 @@ func main() {
 				if ack_is_within_the_window {
 					acknowleged_any_in_flight_segments := false
 
-					// NOTE jfd 23/06/26: cumulatively acknowledge segments
+					// NOTE 23/06/26: cumulatively acknowledge segments
 					for len(in_flight_segments) > 0 && in_flight_segments[0].Seq_num <= uint32(ack_num) {
 
 						segment_acked := in_flight_segments[0]
@@ -281,7 +375,7 @@ func main() {
 								sample_rtt := float64(time.Since(sent_time)) / float64(time.Microsecond)
 								delete(in_flight_segment_sent_times, segment_acked.Seq_num)
 
-								// NOTE jfd 19/06/26: init the average and variance
+								// NOTE 19/06/26: init the average and variance
 								if average_rtt == 0 {
 									average_rtt = sample_rtt
 									rtt_variance = average_rtt / 2
@@ -301,18 +395,18 @@ func main() {
 						window_base_seq_num++
 						acknowleged_any_in_flight_segments = true
 						if window_size < slow_start_threshold {
-							count_acks_received = 0
+							count_in_order_acks_received = 0
 							window_size += window_increase_amount
 						} else {
-							count_acks_received++
+							count_in_order_acks_received++
 						}
 
 					}
 
-					if count_acks_received >= window_size {
-						// NOTE jfd 18/06/26: AIMD
+					if count_in_order_acks_received >= window_size {
+						// NOTE 18/06/26: AIMD
 						window_size += window_increase_amount
-						count_acks_received = 0
+						count_in_order_acks_received = 0
 					}
 
 					if acknowleged_any_in_flight_segments {
@@ -358,7 +452,7 @@ func main() {
 
 		}
 
-		// NOTE jfd 17/06/26: fill the window with segments
+		// NOTE 17/06/26: fill the window with segments
 		if len(send_segment_queue) > 0 {
 
 			window_was_empty := (len(in_flight_segments) == 0)
@@ -372,6 +466,9 @@ func main() {
 					send_segment_queue = append([]Segment{segment}, send_segment_queue...)
 					break
 				}
+
+				total_bytes_transmitted += int(segment.Data_len)
+
 				in_flight_segment_sent_times[segment.Seq_num] = time.Now()
 
 				in_flight_segments = append(in_flight_segments, segment)
@@ -383,7 +480,7 @@ func main() {
 
 		}
 
-		if received_end_text_segment {
+		if received_end_text_segment && !test_mode_enabled {
 			text_buf := print_backing_buf[:0]
 			for _, m := range receive_segment_queue {
 				text_buf = append(text_buf, m.Data[:m.Data_len]...)
@@ -459,20 +556,22 @@ func get_user_input(send_segment_channel chan<- Segment) {
 	}
 }
 
-func get_test_input(send_segment_channel chan<- Segment) {
+func generate_test_traffic(bits_to_send int, delay_interval time.Duration, send_segment_channel chan<- Segment) {
 
 	rand_source := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(rand_source)
 
+	s := "macaco"
+
 	min_random_text_len := 1
-	max_random_text_len := 200
+	max_random_text_len := (bits_to_send>>3)/len(s)
 
 	for {
-		random_text := strings.Repeat("macaco", max(min_random_text_len, rng.Intn(max_random_text_len)))
+		random_text := strings.Repeat(s, max(min_random_text_len, rng.Intn(max_random_text_len)))
 		log.Printf("sending test segment '%s'\n", random_text)
 
 		send_text_message(random_text, send_segment_channel)
-		time.Sleep(time.Millisecond*10)
+		time.Sleep(delay_interval)
 	}
 
 }
@@ -509,9 +608,9 @@ func send_segment_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, segment Se
 	return err
 }
 
-func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision) {
+func groq_loop(metrics_channel <-chan LLM_metrics, decision_channel chan<- Decision) {
 
-	// NOTE jfd 22/06/26: don't use the LLM if AIMD is enabled
+	// NOTE 22/06/26: don't use the LLM if AIMD is enabled
 	if os.Getenv("AIMD_ENABLED") == "1" {
 		return
 	}
@@ -548,6 +647,9 @@ func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision)
 			Messages:       groq_segments,
 			ResponseFormat: groq.ResponseFormat{Type: "json_object"},
 		})
+
+		// HERE
+		// TODO: make sure llm isn't invoked more often than the rate limit allows
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -562,6 +664,8 @@ func groq_loop(metrics_channel <-chan Metrics, decision_channel chan<- Decision)
 			decision_channel <- decision
 		}
 
+
+
 	}
 
 }
@@ -571,12 +675,10 @@ func exponential_moving_average(avg float64, sample float64, coefficient float64
 	return result
 }
 
-func dump_metrics_to_csv(path string, m Metrics) error {
-	// check if file exists
+func dump_metrics_to_csv(path string, m Profile_metrics) error {
 	_, err := os.Stat(path)
 	fileExists := err == nil
 
-	// open file in append mode, create if missing
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return err
@@ -589,7 +691,6 @@ func dump_metrics_to_csv(path string, m Metrics) error {
 	t := reflect.TypeOf(m)
 	v := reflect.ValueOf(m)
 
-	// build header + row
 	header := make([]string, 0, t.NumField())
 	row := make([]string, 0, t.NumField())
 
@@ -617,14 +718,12 @@ func dump_metrics_to_csv(path string, m Metrics) error {
 		}
 	}
 
-	// write header only if file didn't exist
 	if !fileExists {
 		if err := w.Write(header); err != nil {
 			return err
 		}
 	}
 
-	// always append row
 	if err := w.Write(row); err != nil {
 		return err
 	}
