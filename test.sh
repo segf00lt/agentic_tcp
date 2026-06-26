@@ -1,33 +1,80 @@
 #!/bin/sh
 
+[ $(whoami) == "root" ] || exit 1
+
 go build || exit 1
 pkill agentic_tcp
-rm *.log
+rm -f *.log
 # rm *.log *.csv
 
 test_duration=300
 
-export TEST_TRAFFIC_DELAY_INTERVAL="1ms"
-export TEST_TRAFFIC_BITS_TO_SEND="9600"
-export PROFILE_METRICS_NAME_PREFIX="profile_with_retransmission_ratio_"
 
-echo "### RUNNING PROFILE 1 ###"
+set -a && . ./.env && set +a
 
-
-./agentic_tcp -listen :9001 -send :9002 &
-./agentic_tcp -listen :9002 -send :9001 &
-
-sleep $test_duration && pkill agentic_tcp
-
-exit
+export TEST_MODE_ENABLED=1
 
 export TEST_TRAFFIC_DELAY_INTERVAL="10ms"
 export TEST_TRAFFIC_BITS_TO_SEND="9600"
-export PROFILE_METRICS_NAME_PREFIX="profile_long_delay_"
 
-echo "### RUNNING PROFILE 2 ###"
+profile() {
+  export PROFILE_METRICS_NAME_PREFIX="profile_$1_with_llm_"
 
-./agentic_tcp -listen :9001 -send :9002 &
-./agentic_tcp -listen :9002 -send :9001 &
+  export LLM_ENABLED=1
 
-sleep $test_duration && pkill agentic_tcp
+  echo "### RUNNING PROFILE A ###"
+  date
+  echo
+
+  GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
+  p1=$!
+
+  GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
+  p2=$!
+
+  sleep $test_duration
+  kill "$p1" "$p2" 2>/dev/null || true
+  wait "$p1" "$p2" 2>/dev/null || true
+
+
+  export LLM_ENABLED=0
+  export PROFILE_METRICS_NAME_PREFIX="profile_$1_without_llm_"
+
+  echo "### RUNNING PROFILE B ###"
+  date
+  echo
+
+
+  GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
+  p1=$!
+
+  GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
+  p2=$!
+
+  sleep $test_duration
+  kill "$p1" "$p2" 2>/dev/null || true
+  wait "$p1" "$p2" 2>/dev/null || true
+
+}
+
+clear_tc_settings() {
+  tc qdisc del dev lo root
+}
+
+clear_tc_settings
+profile clean
+
+clear_tc_settings
+tc qdisc add dev lo root netem delay 80ms 20ms loss 1% reorder 3% || exit 1
+profile mobile
+
+clear_tc_settings
+tc qdisc add dev lo root netem delay 300ms 50ms loss 0.5% || exit 1
+profile satellite
+
+clear_tc_settings
+tc qdisc add dev lo root netem delay 20ms 5ms loss 0.1% || exit 1
+profile wifi
+
+
+clear_tc_settings

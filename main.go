@@ -64,9 +64,11 @@ type Profile_metrics struct {
 	Slow_start_threshold              int     `json:"slow_start_threshold"`
 }
 
-type Decision struct {
+type LLM_output struct {
+	Request_error              error   `json:"-"`
+	Tokens_used                int     `json:"-"`
 	New_cwnd                   int     `json:"new_cwnd"`
-	New_ssthresh               int     `json:"new_sshresh"`
+	New_ssthresh               int     `json:"new_ssthresh"`
 }
 
 func main() {
@@ -149,8 +151,7 @@ func main() {
 	send_segment_channel := make(chan Segment, 128)
 	receive_segment_channel := make(chan Segment, 128)
 
-	llm_metrics_channel := make(chan LLM_metrics, 128)
-	decision_channel := make(chan Decision, 128)
+	llm_output_channel := make(chan LLM_output, 3)
 
 	send_segment_queue := make([]Segment, 0, 128)
 	receive_segment_queue := make([]Segment, 0, 128) // NOTE 17/06/26: this stores the segments that arrive so that we can join them together once we have a begin and end text segment
@@ -175,6 +176,11 @@ func main() {
 	test_mode_enabled := (TEST_MODE_ENABLED == "1")
 	llm_enabled := (LLM_ENABLED == "1")
 
+	var groq_client *groq.Client
+	if llm_enabled {
+		groq_client = groq.NewClient()
+	}
+
 	if test_mode_enabled {
 		go generate_test_traffic(test_traffic_bits_to_send, test_traffic_delay_interval, send_segment_channel)
 	} else {
@@ -182,10 +188,6 @@ func main() {
 	}
 
 	go get_incoming_segments(conn, receive_segment_channel)
-
-	if llm_enabled {
-		go groq_loop(llm_metrics_channel, decision_channel)
-	}
 
 	// NOTE 19/06/26: tracking metrics for profiling and agentic congestion control
 	average_rtt := 0.0
@@ -203,7 +205,8 @@ func main() {
 	count_raw_acks_received := 0
 	raw_ack_threshold := 0
 	raw_ack_count_ticker := time.NewTicker(time.Second * 10)
-	invoke_llm := false
+	call_llm := false
+	last_llm_call_time := time.Now()
 
 	// NOTE 17/06/26: this timer stuff in go is very confusing
 	stop_timer := func() {
@@ -277,8 +280,8 @@ func main() {
 			}()
 
 			// TODO: come up with a condition to trigger the LLM on apart from periodic triggering
-			if invoke_llm {
-				invoke_llm = false
+			if call_llm && llm_enabled {
+				call_llm = false
 
 				llm_metrics := LLM_metrics{
 					Avg_rtt: average_rtt,
@@ -293,18 +296,15 @@ func main() {
 					Prev_ssthresh: prev_slow_start_threshold,
 				}
 
-				llm_metrics_channel <- llm_metrics
+				if time.Since(last_llm_call_time) > time.Second * 7 {
+					last_llm_call_time = time.Now()
+					log.Printf("calling llm\n")
+					go run_llm(groq_client, llm_metrics, llm_output_channel)
+				} else {
+					call_llm = true
+				}
+
 			}
-
-			// current_metrics_are_valid := (average_rtt > 0.0)
-
-			// previous_decision_received := (len(decision_channel) == 0)
-
-			// if current_metrics_are_valid && previous_decision_received {
-			// 	if llm_enabled {
-			// 		metrics_channel <- metrics
-			// 	}
-			// }
 
 		case <-timeout_channel:
 			if len(in_flight_segments) == 0 {
@@ -332,10 +332,14 @@ func main() {
 
 			}
 
-		case decision := <-decision_channel:
-			log.Printf("agent decision: %+v", decision)
-			window_size = decision.New_cwnd
-			slow_start_threshold = decision.New_ssthresh
+		case output := <-llm_output_channel:
+			log.Printf("llm output! cur_cwnd: %d, cur_ssthresh: %d, new_cwnd: %d, new_ssthresh: %d\n", window_size, slow_start_threshold, output.New_cwnd, output.New_ssthresh)
+			// cowabunga
+			if output.Request_error != nil {
+				panic(output.Request_error)
+			}
+			window_size = max(min_window_size, output.New_cwnd)
+			slow_start_threshold = max(min_slow_start_threshold, output.New_ssthresh)
 
 		case segment_to_send := <-send_segment_channel:
 			segment_to_send.Seq_num = uint32(next_seq_num)
@@ -350,7 +354,7 @@ func main() {
 				if raw_ack_threshold_computed {
 					count_raw_acks_received++
 					if count_raw_acks_received >= raw_ack_threshold {
-						invoke_llm = true
+						call_llm = true
 						count_raw_acks_received = 0
 					}
 				}
@@ -608,65 +612,85 @@ func send_segment_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, segment Se
 	return err
 }
 
-func groq_loop(metrics_channel <-chan LLM_metrics, decision_channel chan<- Decision) {
+func run_llm(client *groq.Client, metrics LLM_metrics, llm_output_channel chan<- LLM_output) {
 
-	// NOTE 22/06/26: don't use the LLM if AIMD is enabled
-	if os.Getenv("AIMD_ENABLED") == "1" {
+	system_prompt :=
+`You are a congestion-control decision engine for a single TCP-like flow.
+
+Input is one JSON object with:
+avg_rtt_us, rtt_variance_us, throughput_ema_bps, prev_throughput_ema_bps,
+retransmission_ratio_ema, prev_retransmission_ratio_ema,
+cwnd, ssthresh, prev_cwnd, prev_ssthresh.
+
+All cwnd and ssthresh values are in segments of a fixed size, not bytes. One segment means one send unit from the Segment struct. Do not convert to bytes.
+cwnd is the current congestion window: how many segments may be in flight.
+ssthresh is the slow-start threshold: above this point, growth should be cautious. It should reflect the last safe window after congestion, and it must never be less than 2 segments.
+
+Goal: choose the next congestion window and slow-start threshold for the next interval.
+
+Rules:
+- Output JSON only, with exactly these integer fields: {"new_cwnd": <int>, "new_ssthresh": <int>}
+- cwnd is an integer number of segments.
+- ssthresh is an integer number of segments.
+- Do not drop cwnd abruptly to 1 unless loss is severe.
+- If retransmissions are present or RTT rises while throughput is flat or falling, treat it as congestion and decrease cwnd multiplicatively.
+- When congestion is detected, set ssthresh to the new cwnd you choose, but never below 2.
+- If RTT is elevated and throughput is not meaningfully improving, treat it as queue buildup and back off noticeably, but not to the minimum in one step.
+- If cwnd and throughput are improving and RTT is falling, you may increase cwnd additively.
+- Prefer small, stable adjustments unless the signal is strong.
+- If cwnd is below 10 segments and the path does not look congested, recover aggressively toward at least 10 segments.
+- Preserve fairness: if RTT is rising but cwnd is not decreasing, avoid overreacting; back off moderately, not excessively.
+- Use the recent trend implied by current and previous values, not a single noisy sample.
+- Never explain your reasoning. Never output extra keys or text.`
+
+	metrics_json, err := json.Marshal(metrics)
+	if err != nil {
 		return
 	}
 
-	client := groq.NewClient()
-
-	if client == nil {
-		panic("failed to create groq client!!!\n")
+	groq_messages := []groq.Message{
+		{
+			Role:    "system",
+			Content: system_prompt,
+		},
+		{
+			Role:    "user",
+			Content: string(metrics_json),
+		},
 	}
 
-	system_prompt :=
-		`You tune AIMD for throughput. Prefer slightly more aggressive growth unless loss/retransmissions are high. If loss_rate < 0.02 and rtt_variance is low, increase window_increase_amount a bit; if loss_rate > 0.05 or retransmission_rate > 0.10, decrease it. Keep window_decrease_factor near 0.5–0.8, more conservative under loss. Make small changes only. Return only JSON:
-{"new_window_increase_amount":int,"new_window_decrease_factor":float}`
+	response, err := client.CreateChatCompletion(groq.CompletionCreateParams{
+		Model:    "llama-3.1-8b-instant",
+		Messages: groq_messages,
+		ResponseFormat: groq.ResponseFormat{
+			Type: "json_object",
+		},
+	})
 
-	for metrics := range metrics_channel {
+	var output LLM_output
 
-		metrics_json, err := json.Marshal(metrics)
+	if err != nil {
+		output.Request_error = err
+		llm_output_channel <- output
+		return
+	}
+
+
+	if response.Usage.TotalTokens != nil {
+		output.Tokens_used = *response.Usage.TotalTokens
+	}
+
+	if len(response.Choices) > 0 {
+		content := response.Choices[0].Message.Content
+
+		err := json.Unmarshal([]byte(content), &output)
 		if err != nil {
-			// TODO: handle the errors
-			continue
+			return
 		}
-		groq_segments := []groq.Message{
-			{
-				Role:    "system",
-				Content: system_prompt,
-			},
-			{
-				Role:    "user",
-				Content: string(metrics_json),
-			},
-		}
-		response, err := client.CreateChatCompletion(groq.CompletionCreateParams{
-			Model:          "llama-3.1-8b-instant",
-			Messages:       groq_segments,
-			ResponseFormat: groq.ResponseFormat{Type: "json_object"},
-		})
-
-		// HERE
-		// TODO: make sure llm isn't invoked more often than the rate limit allows
-		if err != nil {
-			fmt.Println(err)
-		}
-
-		if len(response.Choices) > 0 {
-			content := response.Choices[0].Message.Content
-			var decision Decision
-			err := json.Unmarshal([]byte(content), &decision)
-			if err != nil {
-				continue
-			}
-			decision_channel <- decision
-		}
-
-
 
 	}
+
+	llm_output_channel <- output
 
 }
 

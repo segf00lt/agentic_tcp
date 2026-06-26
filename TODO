@@ -24,11 +24,11 @@
 TODO 26/06/26
 
 
-- Test triggering llm when the raw acked bytes goes over a sampled threshold.
+- DONE Test triggering llm when the raw acked bytes goes over a sampled threshold.
   The sample is taken over the first 10 seconds of the run. Then multiply by some parameter say 0.1
   You could periodically update this threshold maybe and whenever the count of acks received goes over
 
-- make a decent prompt
+- DONE make a decent prompt
 - Experiment with llm
 - Setup test benches so we can run benchmarks easily
   - The tests should also test with some different simulated conditions (wifi simulation, sattelite, etc.)
