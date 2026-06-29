@@ -19,6 +19,10 @@
 
 
 
+TODO 29/06/26
+
+- Clean up metrics tracking code
+
 
 
 TODO 26/06/26
@@ -29,11 +33,10 @@ TODO 26/06/26
   You could periodically update this threshold maybe and whenever the count of acks received goes over
 
 - DONE make a decent prompt
-- Experiment with llm
-- Setup test benches so we can run benchmarks easily
+- DONE Experiment with llm
+- DONE Setup test benches so we can run benchmarks easily
   - The tests should also test with some different simulated conditions (wifi simulation, sattelite, etc.)
   - The parameters for the EMAs should be tunable, as well as bitrate for the test, profiling frequency, etc.
-- Clean up metrics tracking code
 
 
 

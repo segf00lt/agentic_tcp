@@ -37,17 +37,60 @@ type Segment struct {
 	Data       [SEGMENT_DATA_SIZE]byte
 }
 
-type LLM_metrics struct {
+type LLM_input struct {
 	Avg_rtt                           float64 `json:"avg_rtt_us"`
 	Rtt_variance                      float64 `json:"rtt_variance_us"`
+
 	Throughput_ema_bps    						float64 `json:"throughput_ema_bps"`
 	Prev_throughput_ema_bps    				float64 `json:"prev_throughput_ema_bps"`
 	Retransmission_ratio_ema 	   	    float64 `json:"retransmission_ratio_ema"`
 	Prev_retransmission_ratio_ema 	  float64 `json:"prev_retransmission_ratio_ema"`
+
+	Throughput_sample_bps    				  float64 `json:"throughput_sample_bps"`
+	Prev_throughput_sample_bps        float64 `json:"prev_throughput_sample_bps"`
+	Retransmission_ratio_sample 	   	float64 `json:"retransmission_ratio_sample"`
+	Prev_retransmission_ratio_sample 	float64 `json:"prev_retransmission_ratio_sample"`
+
+	Throughput_sample_history    			[]float64  `json:"throughput_sample_history"`
+
+	Total_bytes_transmitted           int     `json:"total_bytes_transmitted"`
 	Cwnd                              int     `json:"cwnd"`
 	Ssthresh                          int     `json:"ssthresh"`
 	Prev_cwnd                         int     `json:"prev_cwnd"`
 	Prev_ssthresh                     int     `json:"prev_ssthresh"`
+}
+
+type LLM_input_sample struct {
+	Avg_rtt                           float64 `json:"avg_rtt_us"`
+	Rtt_variance                      float64 `json:"rtt_variance_us"`
+	Throughput_sample_bps    				  float64 `json:"throughput_sample_bps"`
+	Prev_throughput_sample_bps        float64 `json:"prev_throughput_sample_bps"`
+	Retransmission_ratio_sample 	   	float64 `json:"retransmission_ratio_sample"`
+	Prev_retransmission_ratio_sample 	float64 `json:"prev_retransmission_ratio_sample"`
+	Total_bytes_transmitted           int     `json:"total_bytes_transmitted"`
+	Cwnd                              int     `json:"cwnd"`
+	Ssthresh                          int     `json:"ssthresh"`
+	Prev_cwnd                         int     `json:"prev_cwnd"`
+	Prev_ssthresh                     int     `json:"prev_ssthresh"`
+}
+
+type LLM_input_ema struct {
+	Avg_rtt                           float64 `json:"avg_rtt_us"`
+	Rtt_variance                      float64 `json:"rtt_variance_us"`
+	Throughput_ema_bps    						float64 `json:"throughput_ema_bps"`
+	Retransmission_ratio_ema 	   	    float64 `json:"retransmission_ratio_ema"`
+	Total_bytes_transmitted           int     `json:"total_bytes_transmitted"`
+	Cwnd                              int     `json:"cwnd"`
+	Ssthresh                          int     `json:"ssthresh"`
+	Prev_cwnd                         int     `json:"prev_cwnd"`
+	Prev_ssthresh                     int     `json:"prev_ssthresh"`
+}
+
+type LLM_input_throughput_history struct {
+	Avg_rtt                           float64 `json:"avg_rtt_us"`
+	Throughput_sample_history    			[]float64   `json:"throughput_sample_history"`
+	Cwnd                              int     `json:"cwnd"`
+	Ssthresh                          int     `json:"ssthresh"`
 }
 
 type Profile_metrics struct {
@@ -69,7 +112,29 @@ type LLM_output struct {
 	Tokens_used                int     `json:"-"`
 	New_cwnd                   int     `json:"new_cwnd"`
 	New_ssthresh               int     `json:"new_ssthresh"`
+	New_timeout_interval       float64 `json:"new_timeout_interval"`
 }
+
+var (
+	LLM_ENABLED                 string
+	TEST_MODE_ENABLED           string
+	TEST_TRAFFIC_BITRATE_BPS    string
+	TEST_TRAFFIC_DELAY_INTERVAL string
+	TEST_TRAFFIC_BITS_TO_SEND   string
+	PROFILE_METRICS_NAME_PREFIX string
+	PROFILE_INTERVAL            string
+	LLM_INPUT_MODE              string
+	LLM_OUTPUT_MODE             string
+)
+
+const (
+	LLM_INPUT_MODE_SAMPLE = "sample"
+	LLM_INPUT_MODE_EMA = "ema"
+	LLM_INPUT_MODE_THROUGHPUT_HISTORY = "throughput_history"
+
+	LLM_OUTPUT_MODE_NORMAL = ""
+	LLM_OUTPUT_MODE_WITH_TIMEOUT = "with_timeout"
+)
 
 func main() {
 
@@ -81,17 +146,31 @@ func main() {
 		test_traffic_delay_interval time.Duration
 		test_traffic_bits_to_send int
 		test_traffic_bitrate_bps int
-		profile_metrics_name_prefix string
+		profile_llm_input_name_prefix string
 		profile_interval time.Duration
 	)
 
-	LLM_ENABLED                 := os.Getenv("LLM_ENABLED")
-	TEST_MODE_ENABLED           := os.Getenv("TEST_MODE_ENABLED")
-	TEST_TRAFFIC_BITRATE_BPS    := os.Getenv("TEST_TRAFFIC_BITRATE_BPS")
-	TEST_TRAFFIC_DELAY_INTERVAL := os.Getenv("TEST_TRAFFIC_DELAY_INTERVAL")
-	TEST_TRAFFIC_BITS_TO_SEND   := os.Getenv("TEST_TRAFFIC_BITS_TO_SEND")
-	PROFILE_METRICS_NAME_PREFIX := os.Getenv("PROFILE_METRICS_NAME_PREFIX")
-	PROFILE_INTERVAL 						:= os.Getenv("PROFILE_INTERVAL")
+	LLM_ENABLED                 = os.Getenv("LLM_ENABLED")
+	TEST_MODE_ENABLED           = os.Getenv("TEST_MODE_ENABLED")
+	TEST_TRAFFIC_BITRATE_BPS    = os.Getenv("TEST_TRAFFIC_BITRATE_BPS")
+	TEST_TRAFFIC_DELAY_INTERVAL = os.Getenv("TEST_TRAFFIC_DELAY_INTERVAL")
+	TEST_TRAFFIC_BITS_TO_SEND   = os.Getenv("TEST_TRAFFIC_BITS_TO_SEND")
+	PROFILE_METRICS_NAME_PREFIX = os.Getenv("PROFILE_METRICS_NAME_PREFIX")
+	PROFILE_INTERVAL 						= os.Getenv("PROFILE_INTERVAL")
+	LLM_INPUT_MODE              = os.Getenv("LLM_INPUT_MODE")
+	LLM_OUTPUT_MODE             = os.Getenv("LLM_OUTPUT_MODE")
+
+	if LLM_INPUT_MODE == "" {
+		LLM_INPUT_MODE = LLM_INPUT_MODE_SAMPLE
+	}
+
+	if LLM_INPUT_MODE != LLM_INPUT_MODE_SAMPLE && LLM_INPUT_MODE != LLM_INPUT_MODE_EMA && LLM_INPUT_MODE != LLM_INPUT_MODE_THROUGHPUT_HISTORY {
+		panic("LLM_INPUT_MODE must be 'sample' or 'ema' or 'throughput_history'")
+	}
+
+	if LLM_OUTPUT_MODE != "" && LLM_OUTPUT_MODE != "timeout" {
+		panic("LLM_OUTPUT_MODE must be 'normal' or 'timeout' or none")
+	}
 
 	if TEST_TRAFFIC_DELAY_INTERVAL != "" {
 		test_traffic_delay_interval, err = time.ParseDuration(TEST_TRAFFIC_DELAY_INTERVAL)
@@ -110,9 +189,9 @@ func main() {
 	}
 
 	if PROFILE_METRICS_NAME_PREFIX == "" {
-		profile_metrics_name_prefix = "metrics_"
+		profile_llm_input_name_prefix = "llm_input_"
 	} else {
-		profile_metrics_name_prefix = PROFILE_METRICS_NAME_PREFIX
+		profile_llm_input_name_prefix = PROFILE_METRICS_NAME_PREFIX
 	}
 
 	if PROFILE_INTERVAL != "" {
@@ -122,7 +201,7 @@ func main() {
 		profile_interval = time.Second * 1
 	}
 
-	profile_metrics_csv_path := fmt.Sprintf("%s%d.csv", profile_metrics_name_prefix, os.Getpid())
+	profile_llm_input_csv_path := fmt.Sprintf("%s%d.csv", profile_llm_input_name_prefix, os.Getpid())
 
 	log_file, err := os.OpenFile(fmt.Sprintf("%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
@@ -189,17 +268,20 @@ func main() {
 
 	go get_incoming_segments(conn, receive_segment_channel)
 
-	// NOTE 19/06/26: tracking metrics for profiling and agentic congestion control
+	// NOTE 19/06/26: tracking input for profiling and agentic congestion control
 	average_rtt := 0.0
 	rtt_variance := 0.0
 	throughput_ema := 0.0
 	acked_bytes := 0
 	retransmission_ratio_ema := 0.0
+	throughput_sample := 0.0
+	retransmission_ratio_sample := 0.0
 	total_bytes_retransmitted := 0
 	total_bytes_transmitted := 0
 	in_flight_segment_sent_times := make(map[uint32]time.Time)
-	profile_metrics_ticker_duration := profile_interval
-	profile_metrics_ticker := time.NewTicker(profile_metrics_ticker_duration)
+	profile_llm_input_ticker_duration := profile_interval
+	profile_llm_input_ticker := time.NewTicker(profile_llm_input_ticker_duration)
+	throughput_sample_history := make([]float64, 0, 4)
 
 	raw_ack_threshold_computed := false
 	count_raw_acks_received := 0
@@ -247,23 +329,35 @@ func main() {
 			raw_ack_threshold_computed = true
 			raw_ack_threshold = count_raw_acks_received / 10
 
-		case <-profile_metrics_ticker.C:
+		case <-profile_llm_input_ticker.C:
 
-			sample_throughput := float64(acked_bytes)*8 / float64(profile_metrics_ticker_duration.Seconds())
-			sample_retransmission_ratio := float64(total_bytes_retransmitted) / float64(total_bytes_transmitted)
-			alpha := 0.125
 			prev_throughput_ema := throughput_ema
 			prev_retransmission_ratio_ema := retransmission_ratio_ema
-			throughput_ema = exponential_moving_average(throughput_ema, sample_throughput, alpha)
-			retransmission_ratio_ema = exponential_moving_average(retransmission_ratio_ema, sample_retransmission_ratio, alpha)
 
-			metrics := Profile_metrics{
+			prev_throughput_sample := throughput_sample
+			prev_retransmission_ratio_sample := retransmission_ratio_sample
+
+			throughput_sample = float64(acked_bytes)*8 / float64(profile_llm_input_ticker_duration.Seconds())
+			retransmission_ratio_sample = float64(total_bytes_retransmitted) / float64(total_bytes_transmitted)
+			if total_bytes_transmitted <= 0 {
+				retransmission_ratio_sample = 0
+			}
+			alpha := 0.125
+			throughput_ema = exponential_moving_average(throughput_ema, throughput_sample, alpha)
+			retransmission_ratio_ema = exponential_moving_average(retransmission_ratio_ema, retransmission_ratio_sample, alpha)
+
+			if len(throughput_sample_history) == cap(throughput_sample_history) {
+				throughput_sample_history = throughput_sample_history[:len(throughput_sample_history) - 1]
+			}
+			throughput_sample_history = append([]float64{ throughput_sample }, throughput_sample_history...)
+
+			input := Profile_metrics{
 				Avg_rtt:                           average_rtt,
 				Rtt_variance:                      rtt_variance,
 				EMA_throughput_bps:                throughput_ema,
 				EMA_retransmission_ratio_bps:      retransmission_ratio_ema,
-				Raw_throughput_bps:                sample_throughput,
-				Raw_retransmission_ratio_bps:      sample_retransmission_ratio,
+				Raw_throughput_bps:                throughput_sample,
+				Raw_retransmission_ratio_bps:      retransmission_ratio_sample,
 				Acked_bytes: 									     acked_bytes,
 				Retransmitted_bytes: 			         total_bytes_retransmitted,
 				Timeout_interval_milliseconds:     float64(timeout_duration) / float64(time.Millisecond),
@@ -271,25 +365,34 @@ func main() {
 				Slow_start_threshold:              slow_start_threshold,
 			}
 
+			go func() {
+				dump_llm_input_to_csv(profile_llm_input_csv_path, input)
+			}()
+
 			acked_bytes = 0
 			total_bytes_retransmitted = 0
 			total_bytes_transmitted = 0
 
-			go func() {
-				dump_metrics_to_csv(profile_metrics_csv_path, metrics)
-			}()
-
-			// TODO: come up with a condition to trigger the LLM on apart from periodic triggering
 			if call_llm && llm_enabled {
 				call_llm = false
 
-				llm_metrics := LLM_metrics{
+				llm_metrics := LLM_input{
 					Avg_rtt: average_rtt,
 					Rtt_variance: rtt_variance,
+
 					Throughput_ema_bps: throughput_ema,
 					Prev_throughput_ema_bps: prev_throughput_ema,
 					Retransmission_ratio_ema: retransmission_ratio_ema,
 					Prev_retransmission_ratio_ema: prev_retransmission_ratio_ema,
+
+					Throughput_sample_bps: throughput_sample,
+					Prev_throughput_sample_bps: prev_throughput_sample,
+					Retransmission_ratio_sample: retransmission_ratio_sample,
+					Prev_retransmission_ratio_sample: prev_retransmission_ratio_sample,
+
+					Throughput_sample_history: throughput_sample_history,
+
+					Total_bytes_transmitted: total_bytes_transmitted,
 					Cwnd: window_size,
 					Ssthresh: slow_start_threshold,
 					Prev_cwnd: prev_window_size,
@@ -612,14 +715,109 @@ func send_segment_over_udp(conn *net.UDPConn, send_addr *net.UDPAddr, segment Se
 	return err
 }
 
-func run_llm(client *groq.Client, metrics LLM_metrics, llm_output_channel chan<- LLM_output) {
+func run_llm(client *groq.Client, input LLM_input, llm_output_channel chan<- LLM_output) {
 
-	system_prompt :=
+	var system_prompt string
+	var err error
+	var llm_input_json []byte
+
+	// NOTE 29/06/26: Different prompts and parameter combinations based on a predefined input mode
+	log.Printf("calling llm in '%s' mode\n", LLM_INPUT_MODE)
+
+	switch LLM_INPUT_MODE {
+	case LLM_INPUT_MODE_THROUGHPUT_HISTORY:
+		system_prompt =
 `You are a congestion-control decision engine for a single TCP-like flow.
 
 Input is one JSON object with:
-avg_rtt_us, rtt_variance_us, throughput_ema_bps, prev_throughput_ema_bps,
-retransmission_ratio_ema, prev_retransmission_ratio_ema,
+avg_rtt_us, throughput_sample_history,
+cwnd, ssthresh,
+
+All cwnd and ssthresh values are in segments of a fixed size, not bytes. One segment means one send unit from the Segment struct. Do not convert to bytes.
+cwnd is the current congestion window: how many segments may be in flight.
+ssthresh is the slow-start threshold: above this point, growth should be cautious. It should reflect the last safe window after congestion, and it must never be less than 2 segments.
+'throughput_sample_history' contains, at most, the last 4 samples of throughput in bps, most recent first. The throughput samples are taken every second.
+
+Goal: choose the next congestion window and slow-start threshold for the next interval.
+
+Rules:
+- Output JSON only, with exactly these integer fields: {"new_cwnd": <int>, "new_ssthresh": <int>}
+- cwnd is an integer number of segments.
+- ssthresh is an integer number of segments.
+- Do not drop cwnd abruptly to 1 unless all 4 of the last throughput samples have been decreasing drastically.
+- When congestion is detected, set ssthresh to the new cwnd you choose, but never below 2.
+- If RTT is elevated and throughput is not meaningfully improving, treat it as queue buildup and back off noticeably, but not to the minimum in one step.
+- If cwnd and throughput are improving and RTT is falling, you may increase cwnd additively.
+- Prefer small, stable adjustments unless the signal is strong.
+- If cwnd is below 10 segments and the path does not look congested, recover aggressively toward at least 10 segments.
+- Preserve fairness: if RTT is rising but cwnd is not decreasing, avoid overreacting; back off moderately, not excessively.
+- Never explain your reasoning. Never output extra keys or text.`
+
+		llm_input_sample := LLM_input_throughput_history{
+			Avg_rtt: input.Avg_rtt,
+			Throughput_sample_history: input.Throughput_sample_history,
+			Cwnd: input.Cwnd,
+			Ssthresh: input.Ssthresh,
+		}
+
+		llm_input_json, err = json.Marshal(llm_input_sample)
+
+	default:
+	case LLM_INPUT_MODE_SAMPLE:
+		system_prompt =
+`You are a congestion-control decision engine for a single TCP-like flow.
+
+Input is one JSON object with:
+avg_rtt_us, rtt_variance_us, throughput_sample_bps, prev_throughput_sample_bps,
+retransmission_ratio_sample, prev_retransmission_ratio_sample, total_bytes_transmitted,
+cwnd, ssthresh, prev_cwnd, prev_ssthresh.
+
+All cwnd and ssthresh values are in segments of a fixed size, not bytes. One segment means one send unit from the Segment struct. Do not convert to bytes.
+cwnd is the current congestion window: how many segments may be in flight.
+ssthresh is the slow-start threshold: above this point, growth should be cautious. It should reflect the last safe window after congestion, and it must never be less than 2 segments.
+The samples of throughput and retransmission ratio are taken every second.
+
+Goal: choose the next congestion window and slow-start threshold for the next interval.
+
+Rules:
+- Output JSON only, with exactly these integer fields: {"new_cwnd": <int>, "new_ssthresh": <int>}
+- cwnd is an integer number of segments.
+- ssthresh is an integer number of segments.
+- Do not drop cwnd abruptly to 1 unless loss is severe.
+- If total_bytes_transmitted is 0 but the throughput is still high that most likely means congestion collapse.
+- If retransmissions are present or RTT rises while throughput is flat or falling, treat it as congestion and decrease cwnd multiplicatively.
+- When congestion is detected, set ssthresh to the new cwnd you choose, but never below 2.
+- If RTT is elevated and throughput is not meaningfully improving, treat it as queue buildup and back off noticeably, but not to the minimum in one step.
+- If cwnd and throughput are improving and RTT is falling, you may increase cwnd additively.
+- Prefer small, stable adjustments unless the signal is strong.
+- If cwnd is below 10 segments and the path does not look congested, recover aggressively toward at least 10 segments.
+- Preserve fairness: if RTT is rising but cwnd is not decreasing, avoid overreacting; back off moderately, not excessively.
+- Use the recent trend implied by current and previous values, not a single noisy sample.
+- Never explain your reasoning. Never output extra keys or text.`
+
+		llm_input_sample := LLM_input_sample{
+			Avg_rtt: input.Avg_rtt,
+			Rtt_variance: input.Rtt_variance,
+			Throughput_sample_bps: input.Throughput_sample_bps,
+			Prev_throughput_sample_bps: input.Prev_throughput_sample_bps,
+			Retransmission_ratio_sample: input.Retransmission_ratio_sample,
+			Prev_retransmission_ratio_sample: input.Prev_retransmission_ratio_sample,
+			Total_bytes_transmitted: input.Total_bytes_transmitted,
+			Cwnd: input.Cwnd,
+			Ssthresh: input.Ssthresh,
+			Prev_cwnd: input.Prev_cwnd,
+			Prev_ssthresh: input.Prev_ssthresh,
+		}
+
+		llm_input_json, err = json.Marshal(llm_input_sample)
+
+	case LLM_INPUT_MODE_EMA:
+		system_prompt =
+`You are a congestion-control decision engine for a single TCP-like flow.
+
+Input is one JSON object with:
+avg_rtt_us, rtt_variance_us, throughput_ema_bps,
+retransmission_ratio_ema, total_bytes_transmitted,
 cwnd, ssthresh, prev_cwnd, prev_ssthresh.
 
 All cwnd and ssthresh values are in segments of a fixed size, not bytes. One segment means one send unit from the Segment struct. Do not convert to bytes.
@@ -633,6 +831,7 @@ Rules:
 - cwnd is an integer number of segments.
 - ssthresh is an integer number of segments.
 - Do not drop cwnd abruptly to 1 unless loss is severe.
+- If total_bytes_transmitted is 0 but the throughput is still high that most likely means congestion collapse.
 - If retransmissions are present or RTT rises while throughput is flat or falling, treat it as congestion and decrease cwnd multiplicatively.
 - When congestion is detected, set ssthresh to the new cwnd you choose, but never below 2.
 - If RTT is elevated and throughput is not meaningfully improving, treat it as queue buildup and back off noticeably, but not to the minimum in one step.
@@ -640,10 +839,23 @@ Rules:
 - Prefer small, stable adjustments unless the signal is strong.
 - If cwnd is below 10 segments and the path does not look congested, recover aggressively toward at least 10 segments.
 - Preserve fairness: if RTT is rising but cwnd is not decreasing, avoid overreacting; back off moderately, not excessively.
-- Use the recent trend implied by current and previous values, not a single noisy sample.
 - Never explain your reasoning. Never output extra keys or text.`
 
-	metrics_json, err := json.Marshal(metrics)
+		llm_input_ema := LLM_input_ema{
+			Avg_rtt: input.Avg_rtt,
+			Rtt_variance: input.Rtt_variance,
+			Throughput_ema_bps: input.Throughput_ema_bps,
+			Retransmission_ratio_ema: input.Retransmission_ratio_ema,
+			Total_bytes_transmitted: input.Total_bytes_transmitted,
+			Cwnd: input.Cwnd,
+			Ssthresh: input.Ssthresh,
+			Prev_cwnd: input.Prev_cwnd,
+			Prev_ssthresh: input.Prev_ssthresh,
+		}
+
+		llm_input_json, err = json.Marshal(llm_input_ema)
+	}
+
 	if err != nil {
 		return
 	}
@@ -655,7 +867,7 @@ Rules:
 		},
 		{
 			Role:    "user",
-			Content: string(metrics_json),
+			Content: string(llm_input_json),
 		},
 	}
 
@@ -699,7 +911,7 @@ func exponential_moving_average(avg float64, sample float64, coefficient float64
 	return result
 }
 
-func dump_metrics_to_csv(path string, m Profile_metrics) error {
+func dump_llm_input_to_csv(path string, m Profile_metrics) error {
 	_, err := os.Stat(path)
 	fileExists := err == nil
 
