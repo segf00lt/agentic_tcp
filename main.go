@@ -37,6 +37,7 @@ type Segment struct {
 	Data       [SEGMENT_DATA_SIZE]byte
 }
 
+// NOTE: Megastruct aggregating all the different parameters that can be passed to the LLM
 type LLM_input struct {
 	Avg_rtt                           float64 `json:"avg_rtt_us"`
 	Rtt_variance                      float64 `json:"rtt_variance_us"`
@@ -94,6 +95,7 @@ type LLM_input_throughput_history struct {
 	Ssthresh                          int     `json:"ssthresh"`
 }
 
+// NOTE: Metrics tracked for profiling purposes
 type Profile_metrics struct {
 	Avg_rtt                           float64 `json:"avg_rtt_micro_seconds"`
 	Rtt_variance                      float64 `json:"rtt_variance_micro_seconds"`
@@ -229,6 +231,8 @@ func main() {
 	}
 	defer conn.Close()
 
+	// NOTE: Important part of the code starts here!
+
 	// NOTE: State for GBN
 
 	send_segment_channel := make(chan Segment, 128)
@@ -264,6 +268,13 @@ func main() {
 		groq_client = groq.NewClient()
 	}
 
+	/* NOTE:
+	The control flow structure of this program consists of 3 threads:
+	- A user or test input thread that writes to the send_segment_channel
+	- A thread that listens for the incoming segments on a UDP socket and writes them to receive_segment_channel
+	- The main thread which controls most of the program execution. See the Go-Back-N main loop further down
+	*/
+
 	// NOTE: Launch user or test input threads
 	if test_mode_enabled {
 		go generate_test_traffic(test_traffic_bits_to_send, test_traffic_delay_interval, send_segment_channel)
@@ -289,6 +300,7 @@ func main() {
 	profile_llm_input_ticker := time.NewTicker(profile_llm_input_ticker_duration)
 	throughput_sample_history := make([]float64, 0, 4)
 
+	// NOTE: Some state for deciding when to call the LLM
 	raw_ack_threshold_computed := false
 	count_raw_acks_received := 0
 	raw_ack_threshold := 0
