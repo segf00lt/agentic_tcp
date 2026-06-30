@@ -337,7 +337,7 @@ func main() {
 		timeout_channel = timer.C
 	}
 
-	for { /* Go-Back-N main loop */
+	for { // NOTE: Go-Back-N main loop
 
 		received_end_text_segment := false
 
@@ -643,7 +643,7 @@ func main() {
 
 		}
 
-	} /* Go-Back-N main loop */
+	} // NOTE: Go-Back-N main loop
 
 }
 
