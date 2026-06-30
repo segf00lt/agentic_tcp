@@ -60,6 +60,7 @@ type LLM_input struct {
 	Prev_ssthresh                     int     `json:"prev_ssthresh"`
 }
 
+// NOTE: Differnt combinations of inputs can be given to the LLM depending on the value of LLM_INPUT_MODE
 type LLM_input_sample struct {
 	Avg_rtt                           float64 `json:"avg_rtt_us"`
 	Rtt_variance                      float64 `json:"rtt_variance_us"`
@@ -150,6 +151,7 @@ func main() {
 		profile_interval time.Duration
 	)
 
+	// NOTE: Read environment variables and set some global variables
 	LLM_ENABLED                 = os.Getenv("LLM_ENABLED")
 	TEST_MODE_ENABLED           = os.Getenv("TEST_MODE_ENABLED")
 	TEST_TRAFFIC_BITRATE_BPS    = os.Getenv("TEST_TRAFFIC_BITRATE_BPS")
@@ -227,6 +229,8 @@ func main() {
 	}
 	defer conn.Close()
 
+	// NOTE: State for GBN
+
 	send_segment_channel := make(chan Segment, 128)
 	receive_segment_channel := make(chan Segment, 128)
 
@@ -260,12 +264,14 @@ func main() {
 		groq_client = groq.NewClient()
 	}
 
+	// NOTE: Launch user or test input threads
 	if test_mode_enabled {
 		go generate_test_traffic(test_traffic_bits_to_send, test_traffic_delay_interval, send_segment_channel)
 	} else {
 		go get_user_input(send_segment_channel)
 	}
 
+	// NOTE: Listen for incoming segments
 	go get_incoming_segments(conn, receive_segment_channel)
 
 	// NOTE 19/06/26: tracking input for profiling and agentic congestion control
@@ -319,7 +325,7 @@ func main() {
 		timeout_channel = timer.C
 	}
 
-	for {
+	for { /* Go-Back-N main loop */
 
 		received_end_text_segment := false
 
@@ -330,6 +336,7 @@ func main() {
 			raw_ack_threshold = count_raw_acks_received / 10
 
 		case <-profile_llm_input_ticker.C:
+			// NOTE: This is where we take various measurements both for profiling and for passing to the LLM
 
 			prev_throughput_ema := throughput_ema
 			prev_retransmission_ratio_ema := retransmission_ratio_ema
@@ -373,6 +380,19 @@ func main() {
 			total_bytes_retransmitted = 0
 			total_bytes_transmitted = 0
 
+			/* NOTE:
+			 * The LLM is only triggered when a certain number of raw acknowledgements are received,
+			 * and at least 7 seconds have passed since the last call to the LLM.
+			 *
+			 * By "raw" we mean that their validity is ignored. If we receive a segment and it's an ACK then count_raw_acks_received
+			 * is incremented.
+			 *
+			 * The raw_ack_threshold is calculated in the case block above this one.
+			 *
+			 * This approach is inspired by the article "CCA Reimagined: An Exploratory Study of Large Language Models for Congestion Control"
+			 * see: https://arxiv.org/html/2604.03857v1
+			 */
+
 			if call_llm && llm_enabled {
 				call_llm = false
 
@@ -415,6 +435,7 @@ func main() {
 			} else {
 				log.Println("TIMEOUT")
 
+				// NOTE: On timeout we resend all segments that were in flight and clear the in_flight_segments array
 				tmp := make([]Segment, len(in_flight_segments))
 				copy(tmp, in_flight_segments)
 				send_segment_queue = append(tmp, send_segment_queue...)
@@ -436,6 +457,8 @@ func main() {
 			}
 
 		case output := <-llm_output_channel:
+			// NOTE: Receive the output from asynchronous calls to the LLM
+
 			log.Printf("llm output! cur_cwnd: %d, cur_ssthresh: %d, new_cwnd: %d, new_ssthresh: %d\n", window_size, slow_start_threshold, output.New_cwnd, output.New_ssthresh)
 			// cowabunga
 			if output.Request_error != nil {
@@ -450,6 +473,8 @@ func main() {
 			send_segment_queue = append(send_segment_queue, segment_to_send)
 
 		case segment_received := <-receive_segment_channel:
+			// NOTE: Handle ACK and normal data segments received
+
 			is_ack := (segment_received.Flags&SEGMENT_FLAG_ACK != 0)
 
 			if is_ack {
@@ -476,7 +501,7 @@ func main() {
 						acked_bytes += int(segment_acked.Data_len)
 
 						sent_time, ok := in_flight_segment_sent_times[segment_acked.Seq_num]
-						{ // track_average_rtt_and_variance
+						{ // NOTE: Track average rtt and variance
 
 							if ok {
 								sample_rtt := float64(time.Since(sent_time)) / float64(time.Microsecond)
@@ -496,11 +521,15 @@ func main() {
 								}
 							}
 
-						} // track_average_rtt_and_variance
+						} // NOTE: Track average rtt and variance
 
 						in_flight_segments = in_flight_segments[1:]
 						window_base_seq_num++
 						acknowleged_any_in_flight_segments = true
+
+						// NOTE: If we are in "slow start" increment window_size whenever we receive an ACK
+						// otherwise only increment later once count_in_order_acks_received has reached window_size
+
 						if window_size < slow_start_threshold {
 							count_in_order_acks_received = 0
 							window_size += window_increase_amount
@@ -548,6 +577,7 @@ func main() {
 					}
 					send_segment_over_udp(conn, send_addr, ack_segment)
 				} else {
+					// NOTE: Send duplicate ACK (duplicate ACKS are ignored but we need to do this for correctness)
 					ack_segment := Segment{
 						Flags:   SEGMENT_FLAG_ACK,
 						Seq_num: uint32(next_expected_seq_num) - 1,
@@ -559,7 +589,7 @@ func main() {
 
 		}
 
-		// NOTE 17/06/26: fill the window with segments
+		// NOTE: If segments have been queued for sending, send them until we've reached the limit of window_size
 		if len(send_segment_queue) > 0 {
 
 			window_was_empty := (len(in_flight_segments) == 0)
@@ -587,6 +617,7 @@ func main() {
 
 		}
 
+		// NOTE: In the non-test mode incoming messages are printed out here once all the segments arrive
 		if received_end_text_segment && !test_mode_enabled {
 			text_buf := print_backing_buf[:0]
 			for _, m := range receive_segment_queue {
@@ -600,10 +631,11 @@ func main() {
 
 		}
 
-	}
+	} /* Go-Back-N main loop */
 
 }
 
+// NOTE: Breaks up a text message in to parts of size SEGMENT_DATA_SIZE and queues up the segments containing each part to be sent
 func send_text_message(text string, send_segment_channel chan<- Segment) {
 	var segment_backing_buf [128]Segment
 
@@ -641,6 +673,7 @@ func send_text_message(text string, send_segment_channel chan<- Segment) {
 
 }
 
+// NOTE: Run asynchronously to get text input from the user's terminal
 func get_user_input(send_segment_channel chan<- Segment) {
 	input_scanner := bufio.NewScanner(os.Stdin)
 	defer input_scanner.Err()
@@ -683,6 +716,7 @@ func generate_test_traffic(bits_to_send int, delay_interval time.Duration, send_
 
 }
 
+// NOTE: Listens for incoming messages on a socket, decodes the segments and queues them up for processing in the receive_segment_channel
 func get_incoming_segments(conn *net.UDPConn, receive_segment_channel chan<- Segment) {
 	buf := make([]byte, math.MaxUint16)
 
@@ -721,9 +755,9 @@ func run_llm(client *groq.Client, input LLM_input, llm_output_channel chan<- LLM
 	var err error
 	var llm_input_json []byte
 
-	// NOTE 29/06/26: Different prompts and parameter combinations based on a predefined input mode
 	log.Printf("calling llm in '%s' mode\n", LLM_INPUT_MODE)
 
+	// NOTE 29/06/26: Different prompts and parameter combinations based on a predefined input mode
 	switch LLM_INPUT_MODE {
 	case LLM_INPUT_MODE_THROUGHPUT_HISTORY:
 		system_prompt =

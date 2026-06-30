@@ -61,26 +61,26 @@ clear_tc_settings() {
   tc qdisc del dev lo root || true
 }
 
-# clear_tc_settings
-# profile clean
+clear_tc_settings
+profile clean
 
-# clear_tc_settings
-# tc qdisc add dev lo root netem delay 80ms 20ms loss 1% reorder 3% || exit 1
-# profile mobile
+clear_tc_settings
+tc qdisc add dev lo root netem delay 80ms 20ms loss 1% reorder 3% || exit 1
+profile mobile
 
-# clear_tc_settings
-# tc qdisc add dev lo root netem delay 300ms 50ms loss 0.5% || exit 1
-# profile satellite
+clear_tc_settings
+tc qdisc add dev lo root netem delay 300ms 50ms loss 0.5% || exit 1
+profile satellite
 
-# clear_tc_settings
-# tc qdisc add dev lo root netem delay 20ms 5ms loss 0.1% || exit 1
-# profile wifi
-
-export LLM_INPUT_MODE=throughput_history
 clear_tc_settings
 tc qdisc add dev lo root netem delay 20ms 5ms loss 0.1% || exit 1
-profile wifi_throughput_history
-unset LLM_INPUT_MODE
+profile wifi
+
+# export LLM_INPUT_MODE=throughput_history
+# clear_tc_settings
+# tc qdisc add dev lo root netem delay 20ms 5ms loss 0.1% || exit 1
+# profile wifi_throughput_history
+# unset LLM_INPUT_MODE
 
 
 clear_tc_settings
