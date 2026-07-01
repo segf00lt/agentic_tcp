@@ -4,3 +4,6 @@ cmd/
 *.log
 *.env
 *.csv
+*.vim
+*.bak
+*.pdf

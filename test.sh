@@ -18,7 +18,6 @@ export TEST_TRAFFIC_DELAY_INTERVAL="10ms"
 export TEST_TRAFFIC_BITS_TO_SEND="9600"
 
 profile() {
-  export PROFILE_METRICS_NAME_PREFIX="profile_$1_with_llm_"
 
   export LLM_ENABLED=1
 
@@ -26,10 +25,10 @@ profile() {
   date
   echo
 
-  GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
+  PROFILE_METRICS_NAME_PREFIX="profile_$1_with_llm_A_" GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
   p1=$!
 
-  GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
+  PROFILE_METRICS_NAME_PREFIX="profile_$1_with_llm_B_" GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
   p2=$!
 
   sleep $test_duration
@@ -38,17 +37,16 @@ profile() {
 
 
   export LLM_ENABLED=0
-  export PROFILE_METRICS_NAME_PREFIX="profile_$1_without_llm_"
 
   echo "### RUNNING PROFILE B ###"
   date
   echo
 
 
-  GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
+  PROFILE_METRICS_NAME_PREFIX="profile_$1_without_llm_A_" GROQ_API_KEY=$GROQ_API_KEY_A ./agentic_tcp -listen :9001 -send :9002 &
   p1=$!
 
-  GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
+  PROFILE_METRICS_NAME_PREFIX="profile_$1_without_llm_B_" GROQ_API_KEY=$GROQ_API_KEY_B ./agentic_tcp -listen :9002 -send :9001 &
   p2=$!
 
   sleep $test_duration
