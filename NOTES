@@ -1,0 +1,41 @@
+# NOTES
+
+
+## Introdução
+
+Escolhemos fazer uma implementação própria de um protocolo de transmissão confiável Go-Back-N, e em cima dele uma aplicação de mensagem-texto CLI apenas para testar o protocolo. (Vale pontuar que no código não há uma barreira de abstração muito explicita entre os dois, visto que arquitetura de software não era o foco principal deste trabalho, e sim fazer experimentos)
+
+## Funcionamento do Protocolo
+
+O nosso protocolo funciona enviando Segmentos que contém um payload de dados de tamanho fixo (8 bytes). Cada segmento é uma parte de uma mensagem de texto maior, sendo o primeiro e ultimo segmento de uma mensagem marcados com flags para indicar que estes segmentos delimitam o início e o fim da mensagem.
+
+Sendo um protocolo Go-Back-N, ele usa ACKs cumulativos para garantir o ordenamento correto de mensagens e um timeout para lidar com perda.
+
+Para o controle de congestionamento foi implementado um algoritmo AIMD com slow start semelhante ao que é usado no TCP Reno, porém, diferente do TCP, a janela de congestionamento e o threshold para slow start são medidos em termos de segmentos de tamanho fixo e não bytes. Nosso protocolo não tenta exatamente imitar um stream de bytes como o TCP.
+
+## Solução e Motivação
+
+Em linha com o espírito exploratório desse trabalho, escolhemos responder a seguinte pergunta: como envolver um LLM no algoritmo de controle de congestionamento do nosso protocolo GBN de forma que obtenhamos algum resultado interessante?
+
+Originalmente consideramos outras áreas onde um LLM poderia ser utilizado, como controle de fluxo, mas decidimos que congestionamento seria uma área onde a capacidade de estimativa do LLM poderia ser empregada de maneira muito mais frutífera, visto que a natureza desse problema exige necessariamente uma solução heurística.
+
+Para melhor informar a implementação de nossa solução, nos apoiamos em dois artigos com objetivos parecidos ao nosso [CITE ARTICLES HERE] A partir desses trabalhos, propomos uma solução que emprega o LLM como um auxílio para o algoritmo de CC tradicional. A seguir, detalharemos a arquitetura da solução.
+
+## Arquitetura
+
+A nossa arquitetura é simples. Durante a execução periodicamente tomamos amostras de diversas métricas e, sob uma condição de ativação, invocamos o LLM e passamos essas amostras e outras métricas derivadas como parâmetros em uma chamada assíncrona. Ao receber o resultado da chamada, o protocolo GBN atualiza a janela de congestionamento e o slow start threshold com os novos valores sugeridos pelo LLM.
+
+Os pontos críticos dessa arquitetura são a condição de ativação e as métricas utilizadas como parâmetro para o LLM.
+
+A condição de ativação possui uma importância dupla. Por um lado, há limitações de recurso e de latência quando se trata do uso do LLM. Precisávamos de algo que seria factível utilizando uma API de LLM gratuita que impõe um limite estrito de tokens por minuto e que não necessitaria de resposta em tempo real do LLM. Por outro lado, o momento que o LLM é ativado tem influência direta sobre o efeito de suas decisões, visto que o congestionamento é um evento que ocorre em um determinado instante no tempo, e os sinais que o antecedem também. Portanto, se invocarmos o LLM toda vez que houver um timeout, ou outro sinal de congestionamento, possa ser que esgotamos nossos recursos finitos. Mas, se não respondermos rápido o bastante, qualquer decisão do LLM será insignificante ou, no pior caso, prejudicial.
+
+Inspirado pelo artigo [CITE ARTICLE] escolhemos chamar o LLM somente quando o número bruto de ACKs recebidos passar de um certo limite. Esse limite é recalculado periodicamente de acordo com o número de ACKs brutos observados em um período. Interpretamos o número bruto de ACKs como uma aproximação para a quantidade de tráfego de ambos os pares, assim, quando essa atividade ficar muito alta podemos inferir que há possibilidade de congestionamento ocorrer e que devemos fazer uma chamada ao LLM. Além disso, para impedir gasto de recurso de API, cada chamada ao LLM deve ocorrer no mínimo 7 segundos após a última.
+
+Além da condição de ativação, temos as métricas que serão usadas como parâmetro. Aqui também se impõe o limite de tokens por minuto da API utilizada para acessar o LLM, por isso os parâmetros precisam ser escolhidos de forma prudente. Novamente tomamos inspiração do artigo [CITE ARTICLE], como também dos campos usados no `struct tcp_info` da implementação de TCP do linux, para escolher estes parâmetros. Algumas configurações de parâmetros diferentes foram testados e serão comparados na seção seguinte.
+
+
+## Experimentos e Resultados
+
+Os experimentos que realizamos consistiram em iniciar duas instâncias de nosso programa que enviam dados de teste aleatórios um para o outro em uma taxa de 960kbps. Usamos a utilidade do Linux `tc` (Traffic Control) para simular condições de rede diferentes: taxa de perda elevado, reordenamento de pacotes, latência etc. Para cada cenário simulado temos duas rodadas de envio de dados que duram 5 minutos, a primeira com o LLM ativado e a segunda com ele desativado. Dessa forma podemos observar o efeito que as decisões do LLM tem sob as medidas seguintes: RTT médio e variância, throughput médio e bruto, taxa de retransmissão média e bruta. Também observamos a variação na janela de congestionamento, no slow start threshold e na duração do timeout, além de algumas outras métricas menos importantes mas úteis para debugging.
+
+

@@ -19,9 +19,15 @@
 
 
 
-TODO 29/06/26
+TODO 01/07/26
 
+- Take some averages and variances of window size and slow start threshold, and the other metrics to enrich our understanding more
 - Clean up metrics tracking code
+
+
+TODO 30/06/26
+
+- DONE track sample index so we can associate specific samples with llm invocations and make correlations
 
 
 

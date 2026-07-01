@@ -128,6 +128,7 @@ var (
 	PROFILE_INTERVAL            string
 	LLM_INPUT_MODE              string
 	LLM_OUTPUT_MODE             string
+	LOG_FILE_NAME_PREFIX        string
 )
 
 const (
@@ -149,7 +150,7 @@ func main() {
 		test_traffic_delay_interval time.Duration
 		test_traffic_bits_to_send int
 		test_traffic_bitrate_bps int
-		profile_llm_input_name_prefix string
+		PROFILE_METRICS_NAME_PREFIX string
 		profile_interval time.Duration
 	)
 
@@ -163,6 +164,7 @@ func main() {
 	PROFILE_INTERVAL 						= os.Getenv("PROFILE_INTERVAL")
 	LLM_INPUT_MODE              = os.Getenv("LLM_INPUT_MODE")
 	LLM_OUTPUT_MODE             = os.Getenv("LLM_OUTPUT_MODE")
+	LOG_FILE_NAME_PREFIX        = os.Getenv("LOG_FILE_NAME_PREFIX")
 
 	if LLM_INPUT_MODE == "" {
 		LLM_INPUT_MODE = LLM_INPUT_MODE_SAMPLE
@@ -193,9 +195,7 @@ func main() {
 	}
 
 	if PROFILE_METRICS_NAME_PREFIX == "" {
-		profile_llm_input_name_prefix = "llm_input_"
-	} else {
-		profile_llm_input_name_prefix = PROFILE_METRICS_NAME_PREFIX
+		PROFILE_METRICS_NAME_PREFIX = "metrics_"
 	}
 
 	if PROFILE_INTERVAL != "" {
@@ -205,9 +205,9 @@ func main() {
 		profile_interval = time.Second * 1
 	}
 
-	profile_llm_input_csv_path := fmt.Sprintf("%s%d.csv", profile_llm_input_name_prefix, os.Getpid())
+	profile_csv_path := fmt.Sprintf("%s%d.csv", PROFILE_METRICS_NAME_PREFIX, os.Getpid())
 
-	log_file, err := os.OpenFile(fmt.Sprintf("%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
+	log_file, err := os.OpenFile(fmt.Sprintf("%s%d.log", os.Getpid()), os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -295,6 +295,7 @@ func main() {
 	retransmission_ratio_sample := 0.0
 	total_bytes_retransmitted := 0
 	total_bytes_transmitted := 0
+	profile_sample_index := 0
 	in_flight_segment_sent_times := make(map[uint32]time.Time)
 	profile_llm_input_ticker_duration := profile_interval
 	profile_llm_input_ticker := time.NewTicker(profile_llm_input_ticker_duration)
@@ -349,6 +350,7 @@ func main() {
 
 		case <-profile_llm_input_ticker.C:
 			// NOTE: This is where we take various measurements both for profiling and for passing to the LLM
+			profile_sample_index++
 
 			prev_throughput_ema := throughput_ema
 			prev_retransmission_ratio_ema := retransmission_ratio_ema
@@ -385,7 +387,7 @@ func main() {
 			}
 
 			go func() {
-				dump_llm_input_to_csv(profile_llm_input_csv_path, input)
+				dump_to_csv(profile_csv_path, input)
 			}()
 
 			acked_bytes = 0
@@ -433,7 +435,7 @@ func main() {
 
 				if time.Since(last_llm_call_time) > time.Second * 7 {
 					last_llm_call_time = time.Now()
-					log.Printf("calling llm\n")
+					log.Printf("profile_sample_index = %d, calling llm\n", profile_sample_index)
 					go run_llm(groq_client, llm_metrics, llm_output_channel)
 				} else {
 					call_llm = true
@@ -445,7 +447,7 @@ func main() {
 			if len(in_flight_segments) == 0 {
 				stop_timer()
 			} else {
-				log.Println("TIMEOUT")
+				log.Println("profile_sample_index = %d, TIMEOUT", profile_sample_index)
 
 				// NOTE: On timeout we resend all segments that were in flight and clear the in_flight_segments array
 				tmp := make([]Segment, len(in_flight_segments))
@@ -464,14 +466,14 @@ func main() {
 				window_size = min_window_size
 				count_in_order_acks_received = 0
 
-				log.Printf("window_size = %d, congestion!!!\n", window_size)
+				log.Printf("profile_sample_index = %d, window_size = %d, congestion!!!\n", profile_sample_index, window_size)
 
 			}
 
 		case output := <-llm_output_channel:
 			// NOTE: Receive the output from asynchronous calls to the LLM
 
-			log.Printf("llm output! cur_cwnd: %d, cur_ssthresh: %d, new_cwnd: %d, new_ssthresh: %d\n", window_size, slow_start_threshold, output.New_cwnd, output.New_ssthresh)
+			log.Printf("profile_sample_index = %d, llm output! cur_cwnd: %d, cur_ssthresh: %d, new_cwnd: %d, new_ssthresh: %d\n", profile_sample_index, window_size, slow_start_threshold, output.New_cwnd, output.New_ssthresh)
 			// cowabunga
 			if output.Request_error != nil {
 				panic(output.Request_error)
@@ -559,7 +561,7 @@ func main() {
 
 					if acknowleged_any_in_flight_segments {
 
-						log.Printf("window_size = %d, increasing...\n", window_size)
+						log.Printf("profile_sample_index = %d, window_size = %d, increasing...\n", profile_sample_index, window_size)
 
 						if len(in_flight_segments) == 0 {
 							stop_timer()
@@ -720,7 +722,7 @@ func generate_test_traffic(bits_to_send int, delay_interval time.Duration, send_
 
 	for {
 		random_text := strings.Repeat(s, max(min_random_text_len, rng.Intn(max_random_text_len)))
-		log.Printf("sending test segment '%s'\n", random_text)
+		log.Printf("sending test segment of size %d\n", len(random_text))
 
 		send_text_message(random_text, send_segment_channel)
 		time.Sleep(delay_interval)
@@ -957,9 +959,9 @@ func exponential_moving_average(avg float64, sample float64, coefficient float64
 	return result
 }
 
-func dump_llm_input_to_csv(path string, m Profile_metrics) error {
+func dump_to_csv(path string, m Profile_metrics) error {
 	_, err := os.Stat(path)
-	fileExists := err == nil
+	file_exists := err == nil
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -1000,7 +1002,7 @@ func dump_llm_input_to_csv(path string, m Profile_metrics) error {
 		}
 	}
 
-	if !fileExists {
+	if !file_exists {
 		if err := w.Write(header); err != nil {
 			return err
 		}
